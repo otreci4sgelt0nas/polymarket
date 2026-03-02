@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+
+    <!-- Unique label — must match the filename (without .plist) -->
+    <key>Label</key>
+    <string>com.polymarket.sync</string>
+
+    <!-- Full path to the sync script -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/home/camper/polymarket/sync_github.sh</string>
+    </array>
+
+    <!-- Run every 30 minutes (1800 seconds) -->
+    <key>StartInterval</key>
+    <integer>1800</integer>
+
+    <!-- Also run once immediately after the agent is loaded -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- Working directory (same as repo root) -->
+    <key>WorkingDirectory</key>
+    <string>/home/camper/polymarket</string>
+
+    <!-- Redirect stdout / stderr to the project log directory -->
+    <key>StandardOutPath</key>
+    <string>/home/camper/polymarket/logs/launchd_sync.log</string>
+    <key>StandardErrorPath</key>
+    <string>/home/camper/polymarket/logs/launchd_sync_err.log</string>
+
+    <!-- Keep the job alive on crash, but don't thrash -->
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <!-- Environment variables needed by git and the script -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/home/camper</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>GIT_BRANCH</key>
+        <string>develop</string>
+        <key>GIT_REMOTE</key>
+        <string>origin</string>
+    </dict>
+
+</dict>
+</plist>
