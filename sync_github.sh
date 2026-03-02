@@ -96,6 +96,14 @@ main() {
 
     cd "$REPO_DIR"
 
+    # Wire gh as git credential helper if gh is available
+    if command -v gh &>/dev/null; then
+        gh auth setup-git 2>/dev/null || true
+    elif [[ -x "$HOME/bin/gh" ]]; then
+        export PATH="$HOME/bin:$PATH"
+        "$HOME/bin/gh" auth setup-git 2>/dev/null || true
+    fi
+
     # Verify this is a git repository
     if ! git rev-parse --git-dir > /dev/null 2>&1; then
         log "${RED}✗ Not a git repository: ${REPO_DIR}${RST}"
