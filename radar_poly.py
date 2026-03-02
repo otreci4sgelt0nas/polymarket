@@ -73,11 +73,12 @@ from colors import G, R, Y, C, W, B, D, M, BL, X
 from signal_engine import compute_signal, get_market_phase, TP_MAX_PRICE, SL_MIN_PRICE
 from ui_panel import draw_panel, format_scrolling_line, HEADER_LINES
 from trade_executor import (
-    handle_buy, execute_close_market, close_all_positions, monitor_tp_sl,
+    handle_buy, execute_close_market, close_all_positions,
     sync_positions,
 )
 from input_handler import wait_for_key, sleep_with_key
 from session_stats import print_session_summary
+from auto_trader import AutoTrader, BackgroundTPSL, AUTO_CLOSE_SECONDS, AUTO_TRADE_ENABLED
 
 # Configuration
 PRICE_ALERT = float(os.getenv('PRICE_ALERT', '0.80'))
@@ -175,6 +176,10 @@ class TradingSession:
         # Error tracking for exponential backoff
         self.binance_errors = 0
         self.market_refresh_errors = 0
+
+        # Automation state
+        self.auto_trader = AutoTrader()          # guards / circuit-breaker
+        self.bg_tpsl: "BackgroundTPSL | None" = None  # non-blocking TP/SL monitor
 
     def set_status(self, msg, duration=3):
         self.status_msg = msg
@@ -372,6 +377,10 @@ def main():
                         session.market_refresh_errors = 0  # reset on success
                         # Detect market transition (new window)
                         if new_slug != session.market_slug:
+                            # Cancel any running background TP/SL monitor before clearing positions
+                            if session.bg_tpsl and session.bg_tpsl.is_running():
+                                session.bg_tpsl.cancel()
+                                session.bg_tpsl = None
                             if session.positions:
                                 print(f"   {Y}{B}MARKET CHANGED → {new_slug} — clearing {len(session.positions)} old position(s){X}")
                                 total_pnl, cnt, session.session_pnl, pnl_list = close_all_positions(
@@ -427,6 +436,34 @@ def main():
                 # Calculate decreasing time remaining
                 elapsed = (now - session.last_market_check) / 60
                 current_time = max(0, session.base_time - elapsed)
+
+                # ── AUTO-CLOSE: positions open and market almost expired ───────────────
+                if session.positions and current_time <= AUTO_CLOSE_SECONDS / 60:
+                    now_str = datetime.now().strftime("%H:%M:%S")
+                    print(f"\n   {Y}{B}⏰ AUTO-CLOSE: {current_time * 60:.0f}s remaining — closing all positions...{X}")
+                    if session.bg_tpsl and session.bg_tpsl.is_running():
+                        session.bg_tpsl.cancel()
+                        session.bg_tpsl = None
+                    execute_close_market(client, session.token_up, session.token_down,
+                                         get_price, _executor)
+                    if session.positions:
+                        total_pnl, cnt, session.session_pnl, pnl_list = close_all_positions(
+                            session.positions, session.token_up, session.token_down,
+                            radar_logger, "auto_close",
+                            session.session_pnl, session.trade_history, get_price)
+                        session.trade_count += cnt
+                        for d, sh, ep, xp, pnl in pnl_list:
+                            session.balance += xp * sh
+                            session.auto_trader.record_trade(pnl)
+                            pnl_color = G if pnl >= 0 else R
+                            print(f"   {Y}  closed {d.upper()} {sh:.0f}sh @ ${xp:.2f} "
+                                  f"{pnl_color}P&L: {'+' if pnl >= 0 else ''}${pnl:.2f}{X}")
+                        pnl_color = G if session.session_pnl >= 0 else R
+                        session.last_action = (
+                            f"{Y}⏰ AUTO-CLOSE{X} │ "
+                            f"{pnl_color}P&L: {'+' if session.session_pnl >= 0 else ''}${session.session_pnl:.2f}{X}"
+                        )
+                        session.set_status(session.last_action, duration=10)
 
                 # Auto-recover WS if not running
                 if not binance_ws._running and HAS_WS:
@@ -499,10 +536,19 @@ def main():
 
                 session.last_phase = current_phase
 
-                # Update history for signal computation
-                session.history.append({
-                    'ts': time.time(), 'up': up_buy, 'down': down_buy, 'btc': btc_price,
-                })
+                # Update history for signal computation — only when price meaningfully changes
+                # to keep divergence and trend calculations accurate (avoid flooding with duplicates)
+                _last_h = session.history[-1] if session.history else None
+                _price_moved = (
+                    _last_h is None
+                    or abs(btc_price - _last_h['btc']) >= 2.0   # $2 BTC move
+                    or abs(up_buy   - _last_h['up'])  >= 0.002  # 0.2¢ token move
+                    or abs(down_buy - _last_h['down']) >= 0.002  # 0.2¢ token move
+                )
+                if _price_moved:
+                    session.history.append({
+                        'ts': time.time(), 'up': up_buy, 'down': down_buy, 'btc': btc_price,
+                    })
 
                 # Compute signal (regime + phase aware)
                 session.current_signal = compute_signal(
@@ -514,9 +560,19 @@ def main():
                         raise KeyboardInterrupt
                     continue
 
-                # Log signal snapshot
+                # Log signal snapshot — include auto-trade decision for post-session analysis
+                _sig = session.current_signal
+                if AUTO_TRADE_ENABLED and _sig and _sig.get('direction') != 'NEUTRAL' and _sig.get('suggestion'):
+                    _entry_price = up_buy if _sig.get('direction') == 'UP' else down_buy
+                    _auto_ok, _auto_reason = session.auto_trader.should_trade(
+                        _sig, session.positions, session.session_pnl,
+                        current_phase, current_regime, current_time, _entry_price)
+                    _auto_decision = "WOULD_TRADE" if _auto_ok else "BLOCKED"
+                else:
+                    _auto_decision, _auto_reason = "", ""
                 radar_logger.log_signal(btc_price, up_buy, down_buy, session.current_signal,
-                                        binance_data, regime=current_regime, phase=current_phase)
+                                        binance_data, regime=current_regime, phase=current_phase,
+                                        auto_decision=_auto_decision, auto_reason=_auto_reason)
 
                 now_str = datetime.now().strftime("%H:%M:%S")
 
@@ -547,6 +603,46 @@ def main():
                 print(format_scrolling_line(now_str, btc_price, up_buy, down_buy,
                                             session.current_signal, session.positions,
                                             current_regime, asset_name=config.display_name))
+
+                # ── BACKGROUND TP/SL: check if monitor has resolved ───────────────────
+                if session.bg_tpsl and session.bg_tpsl.done:
+                    outcome, exit_price = session.bg_tpsl.result
+                    session.bg_tpsl = None
+                    pos = session.positions[0] if session.positions else None
+                    if pos:
+                        exit_color = G if outcome == 'TP' else (Y if outcome == 'CANCEL' else R)
+                        sys.stdout.write('\a')
+                        sys.stdout.flush()
+                        print(f"\n   {exit_color}{B}⚡ {outcome} @ ${exit_price:.2f}! Auto-closing...{X}")
+                        close_msg = execute_close_market(
+                            client, session.token_up, session.token_down,
+                            get_price, _executor)
+                        print(f"   {close_msg}")
+                        pnl = (exit_price - pos['price']) * pos['shares'] if exit_price > 0 else 0
+                        session.session_pnl += pnl
+                        session.trade_count += 1
+                        session.trade_history.append(pnl)
+                        radar_logger.log_trade(
+                            "CLOSE", pos['direction'], pos['shares'], exit_price,
+                            pos['shares'] * exit_price, outcome.lower(), pnl, session.session_pnl)
+                        pnl_color = G if pnl >= 0 else R
+                        session.last_action = (
+                            f"{exit_color}{B}{outcome}{X} @ ${exit_price:.2f} │ "
+                            f"{pnl_color}P&L: {'+' if pnl >= 0 else ''}${pnl:.2f}{X}"
+                        )
+                        session.balance += exit_price * pos['shares']
+                        session.positions.clear()
+                        session.auto_trader.record_trade(pnl)
+                        print(f"   {pnl_color}{B}P&L: {'+' if pnl >= 0 else ''}${pnl:.2f} │ "
+                              f"Session: {'+' if session.session_pnl >= 0 else ''}${session.session_pnl:.2f} "
+                              f"({session.trade_count} trades){X}")
+                elif session.bg_tpsl and session.bg_tpsl.is_running():
+                    # Show live progress in the scrolling log each cycle
+                    cur_tpsl_price = (up_buy if session.positions and session.positions[0]['direction'] == 'up'
+                                      else down_buy)
+                    prog = session.bg_tpsl.progress_info(cur_tpsl_price)
+                    if prog:
+                        print(f"   {M}⏳ monitoring {prog}{X}")
 
                 # --- MEAN REVERSION ALERT (MID + RSI extreme + BB touch + token cheap) ---
                 if current_phase == 'MID' and (now - session.last_beep) > 30:
@@ -605,23 +701,31 @@ def main():
                 # Use phase-dependent threshold (CLOSING phase = 999, blocks all)
                 effective_threshold = max(SIGNAL_STRENGTH_BEEP, phase_threshold)
                 if SIGNAL_ENABLED and strength >= effective_threshold and s_dir != 'NEUTRAL' and sug:
-                    phase_info = f" │ Phase: {current_phase}" if current_phase != 'MID' else ""
-                    regime_info = f" │ Regime: {current_regime}" if current_regime != 'RANGE' else ""
-                    print()
-                    print(f"   {color}{B}{'═' * 55}{X}")
-                    print(f"   {color}{B}OPPORTUNITY! {sym} {s_dir} {strength}%{X}")
-                    print(f"   {W}   Entry: ${sug['entry']:.2f} → TP: ${sug['tp']:.2f} (+${sug['tp'] - sug['entry']:.2f}) / SL: ${sug['sl']:.2f} (-${sug['entry'] - sug['sl']:.2f}){X}")
-                    print(f"   {W}   Amount: ${trade_amount:.0f} │ Trend: {trend:+.2f} │ SR: {sr_raw:+.1f}→{sr_adj:+.1f}{regime_info}{phase_info}{X}")
-                    print(f"   {color}{B}{'═' * 55}{X}")
+                    trade_dir = 'up' if s_dir == 'UP' else 'down'
+                    entry_price = up_buy if trade_dir == 'up' else down_buy
 
-                    key = wait_for_key(timeout_sec=10)
+                    # ── AUTO-TRADE PATH ───────────────────────────────────────────────
+                    auto_ok, auto_reason = session.auto_trader.should_trade(
+                        session.current_signal, session.positions, session.session_pnl,
+                        current_phase, current_regime, current_time, entry_price)
 
-                    if key == 's':
-                        trade_dir = 'up' if s_dir == 'UP' else 'down'
+                    if auto_ok:
+                        sys.stdout.write('\a')
+                        sys.stdout.flush()
+                        print()
+                        print(f"   {color}{B}{'═' * 55}{X}")
+                        print(f"   {color}{B}🤖 AUTO-TRADE {sym} {s_dir} {strength}%{X}")
+                        print(f"   {W}   Entry: ${sug['entry']:.2f} → TP: ${sug['tp']:.2f} "
+                              f"(+${sug['tp'] - sug['entry']:.2f}) / SL: ${sug['sl']:.2f} "
+                              f"(-${sug['entry'] - sug['sl']:.2f}){X}")
+                        print(f"   {W}   Amount: ${trade_amount:.0f} │ Regime: {current_regime} │ Phase: {current_phase}{X}")
+                        print(f"   {color}{B}{'═' * 55}{X}")
+
                         info, session.balance, session.last_action = handle_buy(
                             client, trade_dir, trade_amount, session.token_up, session.token_down,
                             session.positions, session.balance, radar_logger,
-                            session.session_pnl, get_price, _executor, reason="signal")
+                            session.session_pnl, get_price, _executor, reason="auto")
+
                         if info:
                             real_entry = info['price']
                             tp = min(real_entry + (sug['tp'] - sug['entry']), TP_MAX_PRICE)
@@ -629,64 +733,81 @@ def main():
                             token_id = session.token_up if trade_dir == 'up' else session.token_down
                             tp_above = tp > real_entry
                             sl_above = sl < real_entry
-
-                            print(f"   {M}{B}⏳ Monitoring TP ${tp:.2f} / SL ${sl:.2f}...{X}")
-                            print()
-                            reason, exit_price = monitor_tp_sl(
+                            session.bg_tpsl = BackgroundTPSL()
+                            session.bg_tpsl.start(
                                 token_id, tp, sl, tp_above, sl_above,
-                                get_price, _executor)
-
-                            print()
-                            if reason == 'TP':
-                                exit_color = G
-                            elif reason == 'CANCEL':
-                                exit_color = Y
-                            else:
-                                exit_color = R
-                            print(f"   {exit_color}{B}⚡ {reason} @ ${exit_price:.2f}! Closing...{X}")
-                            close_msg = execute_close_market(
-                                client, session.token_up, session.token_down,
-                                get_price, _executor)
-                            print(f"   {close_msg}")
-                            pnl = (exit_price - real_entry) * info['shares']
-                            session.session_pnl += pnl
-                            session.trade_count += 1
-                            session.trade_history.append(pnl)
-                            radar_logger.log_trade("CLOSE", trade_dir, info['shares'], exit_price,
-                                                   info['shares'] * exit_price, reason.lower(),
-                                                   pnl, session.session_pnl)
-                            pnl_color = G if pnl >= 0 else R
-                            session.last_action = f"{exit_color}{B}{reason}{X} @ ${exit_price:.2f} │ {pnl_color}P&L: {'+' if pnl >= 0 else ''}${pnl:.2f}{X}"
-                            print(f"   {pnl_color}{B}P&L: {'+' if pnl >= 0 else ''}${pnl:.2f} │ Session: {'+' if session.session_pnl >= 0 else ''}${session.session_pnl:.2f} ({session.trade_count} trades){X}")
-                            session.balance += exit_price * info['shares']
-                            session.positions.clear()
-                            print(f"   {D}Returning to radar...{X}")
+                                get_price, entry_price=real_entry)
+                            print(f"   {M}{B}⏳ Background TP/SL armed — TP ${tp:.2f} / SL ${sl:.2f}{X}")
+                            print(f"   {D}Radar continues monitoring...{X}")
                             print()
                         else:
-                            session.last_action = f"{R}✗ BUY {trade_dir.upper()} FAILED{X}"
+                            session.last_action = f"{R}✗ AUTO-BUY {trade_dir.upper()} FAILED{X}"
+                        session.last_beep = time.time()
 
-                        session.last_beep = time.time()
-                    elif key in ('u', 'd'):
-                        manual_dir = 'up' if key == 'u' else 'down'
-                        info, session.balance, session.last_action = handle_buy(
-                            client, manual_dir, trade_amount, session.token_up, session.token_down,
-                            session.positions, session.balance, radar_logger,
-                            session.session_pnl, get_price, _executor, reason="manual")
-                        draw_panel(now_str, session.balance, btc_price, bin_direction, confidence,
-                                   binance_data, session.market_slug, current_time, up_buy,
-                                   down_buy, session.positions, session.current_signal, trade_amount,
-                                   session.alert_active, session.alert_side, session.alert_price,
-                                   session.session_pnl, session.trade_count,
-                                   regime=current_regime, phase=current_phase,
-                                   data_source=data_source, ws_status=binance_ws.status,
-                                   price_to_beat=session.price_to_beat,
-                                   trade_history=session.trade_history,
-                                   last_action=session.last_action, asset_name=config.display_name,
-                                   poly_latency_ms=session.poly_latency_ms)
                     else:
-                        print(f"   {D}Ignored.{X}")
+                        # ── MANUAL PATH (unchanged behaviour when auto-trade is off or blocked) ──
+                        phase_info = f" │ Phase: {current_phase}" if current_phase != 'MID' else ""
+                        regime_info = f" │ Regime: {current_regime}" if current_regime != 'RANGE' else ""
+                        # Show why auto-trade was skipped (only when AUTO_TRADE_ENABLED=1)
+                        auto_label = (f"\n   {D}  auto skipped: {auto_reason}{X}"
+                                      if AUTO_TRADE_ENABLED else "")
                         print()
-                        session.last_beep = time.time()
+                        print(f"   {color}{B}{'═' * 55}{X}")
+                        print(f"   {color}{B}OPPORTUNITY! {sym} {s_dir} {strength}%{X}")
+                        print(f"   {W}   Entry: ${sug['entry']:.2f} → TP: ${sug['tp']:.2f} "
+                              f"(+${sug['tp'] - sug['entry']:.2f}) / SL: ${sug['sl']:.2f} "
+                              f"(-${sug['entry'] - sug['sl']:.2f}){X}")
+                        print(f"   {W}   Amount: ${trade_amount:.0f} │ Trend: {trend:+.2f} │ SR: {sr_raw:+.1f}→{sr_adj:+.1f}{regime_info}{phase_info}{X}")
+                        print(f"   {color}{B}{'═' * 55}{X}")
+                        if AUTO_TRADE_ENABLED:
+                            print(f"   {D}  auto skipped: {auto_reason}{X}")
+                        print()
+
+                        key = wait_for_key(timeout_sec=10)
+
+                        if key == 's':
+                            info, session.balance, session.last_action = handle_buy(
+                                client, trade_dir, trade_amount, session.token_up, session.token_down,
+                                session.positions, session.balance, radar_logger,
+                                session.session_pnl, get_price, _executor, reason="signal")
+                            if info:
+                                real_entry = info['price']
+                                tp = min(real_entry + (sug['tp'] - sug['entry']), TP_MAX_PRICE)
+                                sl = max(real_entry - (sug['entry'] - sug['sl']), SL_MIN_PRICE)
+                                token_id = session.token_up if trade_dir == 'up' else session.token_down
+                                tp_above = tp > real_entry
+                                sl_above = sl < real_entry
+                                session.bg_tpsl = BackgroundTPSL()
+                                session.bg_tpsl.start(
+                                    token_id, tp, sl, tp_above, sl_above,
+                                    get_price, entry_price=real_entry)
+                                print(f"   {M}{B}⏳ Background TP/SL armed — TP ${tp:.2f} / SL ${sl:.2f}{X}")
+                                print(f"   {D}Radar continues monitoring (press C to close)...{X}")
+                                print()
+                            else:
+                                session.last_action = f"{R}✗ BUY {trade_dir.upper()} FAILED{X}"
+                            session.last_beep = time.time()
+                        elif key in ('u', 'd'):
+                            manual_dir = 'up' if key == 'u' else 'down'
+                            info, session.balance, session.last_action = handle_buy(
+                                client, manual_dir, trade_amount, session.token_up, session.token_down,
+                                session.positions, session.balance, radar_logger,
+                                session.session_pnl, get_price, _executor, reason="manual")
+                            draw_panel(now_str, session.balance, btc_price, bin_direction, confidence,
+                                       binance_data, session.market_slug, current_time, up_buy,
+                                       down_buy, session.positions, session.current_signal, trade_amount,
+                                       session.alert_active, session.alert_side, session.alert_price,
+                                       session.session_pnl, session.trade_count,
+                                       regime=current_regime, phase=current_phase,
+                                       data_source=data_source, ws_status=binance_ws.status,
+                                       price_to_beat=session.price_to_beat,
+                                       trade_history=session.trade_history,
+                                       last_action=session.last_action, asset_name=config.display_name,
+                                       poly_latency_ms=session.poly_latency_ms)
+                        else:
+                            print(f"   {D}Ignored.{X}")
+                            print()
+                            session.last_beep = time.time()
 
                 # Price alert
                 session.update_alert(up_buy, down_buy)
@@ -727,6 +848,10 @@ def main():
                                trade_history=session.trade_history,
                                last_action=session.last_action, asset_name=config.display_name,
                                poly_latency_ms=session.poly_latency_ms)
+                    # Cancel any running background TP/SL monitor first
+                    if session.bg_tpsl and session.bg_tpsl.is_running():
+                        session.bg_tpsl.cancel()
+                        session.bg_tpsl = None
                     msg = execute_close_market(client, session.token_up, session.token_down,
                                               get_price, _executor)
                     if session.positions:
@@ -737,6 +862,7 @@ def main():
                         session.trade_count += cnt
                         for d, sh, ep, xp, pnl in pnl_list:
                             session.balance += xp * sh
+                            session.auto_trader.record_trade(pnl)
                     # Show result in static panel
                     pnl_color = G if session.session_pnl >= 0 else R
                     session.set_status(

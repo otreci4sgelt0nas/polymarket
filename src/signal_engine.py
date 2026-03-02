@@ -7,11 +7,14 @@ import os
 from colors import G, R, Y, D, M
 
 # Signal weights
-W_MOMENTUM = float(os.getenv('W_MOMENTUM', '0.30'))
+# Momentum and S/R get +5 % each; MACD and VWAP each give back 5 %
+# (MACD was contributing ~0 in ranging markets; the freed weight goes to
+# components that fire consistently).
+W_MOMENTUM = float(os.getenv('W_MOMENTUM', '0.35'))
 W_DIVERGENCE = float(os.getenv('W_DIVERGENCE', '0.20'))
-W_SR = float(os.getenv('W_SUPPORT_RESISTANCE', '0.10'))
-W_MACD = float(os.getenv('W_MACD', '0.15'))
-W_VWAP = float(os.getenv('W_VWAP', '0.15'))
+W_SR = float(os.getenv('W_SUPPORT_RESISTANCE', '0.15'))
+W_MACD = float(os.getenv('W_MACD', '0.10'))
+W_VWAP = float(os.getenv('W_VWAP', '0.10'))
 W_BB = float(os.getenv('W_BOLLINGER', '0.10'))
 
 # Volatility
@@ -26,7 +29,7 @@ REGIME_COUNTER_MULT = float(os.getenv('REGIME_COUNTER_MULT', '0.70'))
 # Phase thresholds
 PHASE_EARLY_THRESHOLD = int(os.getenv('PHASE_EARLY_THRESHOLD', '50'))
 PHASE_MID_THRESHOLD = int(os.getenv('PHASE_MID_THRESHOLD', '30'))
-PHASE_LATE_THRESHOLD = int(os.getenv('PHASE_LATE_THRESHOLD', '70'))
+PHASE_LATE_THRESHOLD = int(os.getenv('PHASE_LATE_THRESHOLD', '45'))
 PHASE_CLOSING_THRESHOLD = 999
 
 # Signal computation thresholds
@@ -141,16 +144,20 @@ def compute_signal(up_buy, down_buy, btc_price, binance, history, regime='RANGE'
         sr_score = sr_raw
     score += sr_score * W_SR
 
-    # 4. MACD HISTOGRAM DELTA (15%) — momentum acceleration
+    # 4. MACD HISTOGRAM DELTA (10%) — momentum acceleration
+    # histogram and hist_delta are now normalised to % of asset price by
+    # compute_macd(), so thresholds are scale-independent:
+    #   0.010 % ≈ $6.50 on a $65 000 BTC   → strong acceleration
+    #   0.003 % ≈ $1.95 on a $65 000 BTC   → moderate acceleration
     macd_hist = binance.get('macd_hist', 0)
     macd_hist_delta = binance.get('macd_hist_delta', 0)
     macd_score = 0.0
-    if abs(macd_hist_delta) > 0.5:
+    if abs(macd_hist_delta) > 0.010:
         # Strong acceleration
         macd_score = 1.0 if macd_hist_delta > 0 else -1.0
-    elif abs(macd_hist_delta) > 0.1:
+    elif abs(macd_hist_delta) > 0.003:
         macd_score = 0.5 if macd_hist_delta > 0 else -0.5
-    # Boost if histogram and delta agree
+    # Boost if histogram and delta agree (trend is accelerating in same direction)
     if macd_hist > 0 and macd_hist_delta > 0:
         macd_score = min(macd_score * 1.2, 1.0)
     elif macd_hist < 0 and macd_hist_delta < 0:

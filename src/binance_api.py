@@ -249,10 +249,10 @@ def compute_macd(candles: list[dict], fast: int | None = None, slow: int | None 
     """MACD optimized for 1-min scalping (fast periods for quick signals).
 
     Returns:
-        macd_line: MACD line value
-        signal_line: signal line value
-        histogram: MACD - signal
-        hist_delta: change in histogram (momentum acceleration)
+        macd_line:   MACD line value (raw USD / asset-price units)
+        signal_line: signal line value (raw USD / asset-price units)
+        histogram:   (MACD - signal) normalised to % of current price
+        hist_delta:  change in histogram (momentum acceleration), also % of price
     """
     if fast is None:
         fast = MACD_FAST
@@ -275,14 +275,21 @@ def compute_macd(candles: list[dict], fast: int | None = None, slow: int | None 
 
     macd_line = macd_values[-1]
     signal_line = signal_values[-1]
-    histogram = macd_line - signal_line
+    raw_histogram = macd_line - signal_line
 
     # Histogram delta (acceleration)
     if len(signal_values) >= 2:
-        prev_hist = macd_values[-2] - signal_values[-2]
-        hist_delta = histogram - prev_hist
+        raw_prev_hist = macd_values[-2] - signal_values[-2]
     else:
-        hist_delta = 0.0
+        raw_prev_hist = raw_histogram
+
+    # Normalise histogram and delta to % of price so thresholds are
+    # scale-independent regardless of the asset's absolute price level.
+    # e.g. $6.50 histogram on a $65 000 BTC → 0.010 %
+    reference_price = closes[-1] if closes[-1] > 0 else 1.0
+    histogram  = raw_histogram  / reference_price * 100
+    prev_hist  = raw_prev_hist  / reference_price * 100
+    hist_delta = histogram - prev_hist
 
     return macd_line, signal_line, histogram, hist_delta
 

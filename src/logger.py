@@ -23,6 +23,7 @@ SIGNAL_COLUMNS = [
     "sr_raw", "sr_adj", "vol_pct", "high_vol",
     "macd_hist", "vwap_pos", "bb_pos",
     "regime", "phase",
+    "auto_decision", "auto_reason",
 ]
 
 TRADE_COLUMNS = [
@@ -90,7 +91,7 @@ class RadarLogger:
         self._signal_writer = None
         self._trade_writer = None
 
-    def log_signal(self, btc_price: float, up_buy: float, down_buy: float, signal: dict | None, binance_data: dict, regime: str = "", phase: str = "") -> None:
+    def log_signal(self, btc_price: float, up_buy: float, down_buy: float, signal: dict | None, binance_data: dict, regime: str = "", phase: str = "", auto_decision: str = "", auto_reason: str = "") -> None:
         """Log one signal snapshot (called every radar cycle ~2s)."""
         try:
             self._ensure_files()
@@ -111,11 +112,12 @@ class RadarLogger:
                     f"{signal.get('vwap_pos', 0):.4f}",
                     f"{signal.get('bb_pos', 0):.4f}",
                     regime, phase,
+                    auto_decision, auto_reason,
                 ]
             else:
                 row = [now, f"{btc_price:.2f}", f"{up_buy:.4f}", f"{down_buy:.4f}",
                        f"{rsi:.1f}", f"{atr:.2f}", "", "", "", "", "", "", "", "",
-                       "", "", "", regime, phase]
+                       "", "", "", regime, phase, auto_decision, auto_reason]
 
             self._signal_writer.writerow(row)
             self._signal_count += 1
