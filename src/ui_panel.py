@@ -173,7 +173,7 @@ def draw_panel(time_str, balance, btc_price, bin_direction, confidence, binance_
     buf.write(f"\033[11;1H\033[K {'─' * (w - 2)}")
 
     # Line 12: Hotkeys
-    buf.write(f"\033[12;1H\033[K {W}{B}U{X}{D}=buy UP{X} │ {W}{B}D{X}{D}=buy DOWN{X} │ {W}{B}C{X}{D}=close all{X} │ {W}{B}S{X}{D}=accept signal{X} │ {W}{B}Q{X}{D}=exit{X}")
+    buf.write(f"\033[12;1H\033[K {W}{B}U{X}{D}=buy UP{X} │ {W}{B}D{X}{D}=buy DOWN{X} │ {W}{B}C{X}{D}=cancel/close{X} │ {W}{B}Q{X}{D}=exit{X}")
 
     # Line 13: bottom separator
     buf.write(f"\033[13;1H\033[K {C}{B}{'═' * (w - 2)}{X}")

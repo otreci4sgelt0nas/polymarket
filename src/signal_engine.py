@@ -14,6 +14,16 @@ W_MACD = float(os.getenv('W_MACD', '0.15'))
 W_VWAP = float(os.getenv('W_VWAP', '0.15'))
 W_BB = float(os.getenv('W_BOLLINGER', '0.10'))
 
+# Validate weight sum at import time so misconfigured .env is caught early
+_WEIGHT_SUM = W_MOMENTUM + W_DIVERGENCE + W_SR + W_MACD + W_VWAP + W_BB
+if abs(_WEIGHT_SUM - 1.0) > 0.01:
+    import warnings
+    warnings.warn(
+        f"Signal weights sum to {_WEIGHT_SUM:.4f} (expected 1.0). "
+        "Signals may be miscalibrated. Check W_* variables in .env.",
+        stacklevel=2,
+    )
+
 # Volatility
 VOL_THRESHOLD = float(os.getenv('VOL_THRESHOLD', '0.03'))
 VOL_AMPLIFIER = float(os.getenv('VOL_AMPLIFIER', '1.3'))

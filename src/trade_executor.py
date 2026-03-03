@@ -7,6 +7,7 @@ import time
 import logging
 from datetime import datetime
 
+
 from py_clob_client.clob_types import (
     OrderArgs, PartialCreateOrderOptions, OrderType,
     AssetType, BalanceAllowanceParams,
@@ -96,8 +97,9 @@ def sync_positions(client, token_up, token_down, positions, get_price):
 
 
 def close_all_positions(positions, token_up, token_down, trade_logger, reason,
-                        session_pnl, trade_history, get_price):
-    """Close all positions and calculate P&L for each.
+                        session_pnl, trade_history, get_price,
+                        client=None, executor=None):
+    """Close all positions on-chain and calculate P&L for each.
 
     Args:
         positions: list of position dicts
@@ -107,11 +109,21 @@ def close_all_positions(positions, token_up, token_down, trade_logger, reason,
         session_pnl: current cumulative P&L
         trade_history: list of individual trade P&L values
         get_price: callable(token_id, side) -> float
+        client: ClobClient instance (required for on-chain close; skipped if None)
+        executor: ThreadPoolExecutor (required for on-chain close; skipped if None)
 
     Returns:
         (total_pnl, count, updated_session_pnl, pnl_list)
         pnl_list: list of (direction, shares, entry_price, exit_price, pnl) per position
     """
+    # Submit on-chain sell orders first (best-effort) before clearing local state
+    if client is not None and executor is not None and positions:
+        try:
+            close_msg = execute_close_market(client, token_up, token_down, get_price, executor)
+            logger.debug("close_all_positions on-chain result: %s", close_msg)
+        except Exception as e:
+            logger.debug("close_all_positions on-chain error: %s", e)
+
     total_pnl = 0.0
     count = 0
     pnl_list = []
@@ -244,12 +256,25 @@ def execute_close_market(client, token_up, token_down, get_price, executor):
 
 
 def monitor_tp_sl(token_id, tp, sl, tp_above, sl_above, get_price, executor,
-                  timeout_sec=TP_SL_MONITOR_TIMEOUT):
-    """Monitor price until TP, SL, manual cancel (C key), or timeout.
+                  timeout_sec=TP_SL_MONITOR_TIMEOUT, time_remaining_fn=None):
+    """Monitor price until TP, SL, manual cancel (C key), timeout, or market expiry.
+
+    Args:
+        time_remaining_fn: optional callable() -> float (minutes left in window).
+                           When it returns <= 0 the monitor exits with 'EXPIRED'.
     Uses concurrent price fetch + key checking for lower latency."""
     price = 0.0
     start = time.time()
     while True:
+        # Exit if the market window has closed
+        if time_remaining_fn is not None:
+            try:
+                tr = time_remaining_fn()
+                if tr <= 0:
+                    return 'EXPIRED', price if price > 0 else get_price(token_id, "BUY")
+            except Exception as e:
+                logger.debug("monitor_tp_sl time_remaining_fn error: %s", e)
+
         if time.time() - start > timeout_sec:
             return 'TIMEOUT', price if price > 0 else get_price(token_id, "BUY")
         # Fetch price concurrently while checking keys

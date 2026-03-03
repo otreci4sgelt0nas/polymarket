@@ -12,12 +12,12 @@ Real-time scalping radar for Polymarket crypto Up/Down markets (BTC, ETH, SOL, X
 - **Phase-aware trading** — Adjusts signal thresholds based on time remaining (EARLY/MID/LATE/CLOSING)
 - **Split-screen terminal UI** — Static panel (top) with live stats + scrolling log (bottom)
 - **Cross-platform** — Runs on Linux, macOS, and Windows 10+
-- **Manual hotkey trading** — Press U/D/C/S/Q to buy UP, buy DOWN, close all, accept a signal, or exit
+- **Manual hotkey trading** — Press U/D/C/Q to buy UP, buy DOWN, close all, or exit
 - **TP/SL monitoring** — Visual progress bar tracking take-profit and stop-loss levels
 - **Multi-market support** — BTC, ETH, SOL, XRP with 5-minute or 15-minute windows
 - **Position sync** — Auto-detects positions opened/closed directly on the Polymarket website
 - **Session stats** — Win rate, P&L, profit factor, and max drawdown
-- **Fully configurable** — 32 parameters via `.env`
+- **Fully configurable** — 33 parameters via `.env`
 
 ## Project Structure
 
@@ -39,9 +39,9 @@ polymarket/
 ├── docs/                        Documentation
 │   ├── index.md                 Documentation hub
 │   ├── TRADING_GUIDE.md         How to trade with the radar
-│   ├── configuration.md         All 29 .env parameters
-│   ├── development-guide.md     Technical reference for developers
-│   └── backlog.md               Feature backlog and roadmap
+│   ├── configuration.md         All 33 .env parameters
+│   └── development-guide.md     Technical reference for developers
+├── CHANGELOG.md                 Version history and fix log
 ├── .env.example                 Config template (copy to .env)
 ├── requirements.txt             Python dependencies
 ├── setup.sh / setup.bat         Setup scripts (Linux/macOS / Windows)
@@ -72,7 +72,7 @@ POLYMARKET_API_KEY=0xYOUR_PRIVATE_KEY_HERE
 
 > **Security:** Never share your private key. After pasting in `.env`, clear your clipboard.
 
-See [docs/configuration.md](docs/configuration.md) for all 29 parameters.
+See [docs/configuration.md](docs/configuration.md) for all 33 parameters.
 
 ### 3. Run
 
@@ -90,8 +90,7 @@ python radar_poly.py 10         # $10 per trade
 |-----|--------|
 | `U` | Buy UP (market order) |
 | `D` | Buy DOWN (market order) |
-| `S` | Accept suggested signal trade |
-| `C` | Emergency close all positions |
+| `C` | Close/cancel all positions |
 | `Q` | Exit (prints session summary) |
 
 ## Screen Layout
@@ -108,7 +107,7 @@ python radar_poly.py 10         # $10 per trade
  SIGNAL  │ ▲ UP      62% [██████░░░░] │ RSI:42↑ │ T:+0.4 │ MACD:+1.2 │ VW:+0.03 │ BB:45%
  ALERT   │ ─
  ─────────────────────────────────────────────────────────────────────────────────────────────
- U=buy UP │ D=buy DOWN │ C=close all │ S=accept signal │ Q=exit
+ U=buy UP │ D=buy DOWN │ C=close/cancel │ Q=exit
  ═══════════════════════════════════════════════════════════════════════════════════════════════
        UP       DN │  RSI  │  SIGNAL   STRENGTH  │ VOL │ TREND │  MACD │  VWAP │  BB  │     S/R     │ RG
    UP:$0.52 DN:$0.48 │ RSI:42↑ │ ▲ UP  62% [██████░░░░] │ VOL↑ │ T:+0.4⬆ │ +1.2▲ │ +0.03↑ │ MD45% │ SR:+0.3→+0.2 │ T▲
@@ -119,9 +118,9 @@ python radar_poly.py 10         # $10 per trade
 | Document | Description |
 |---|---|
 | **[Trading Guide](docs/TRADING_GUIDE.md)** | Indicators explained, entry/exit rules, scenarios, risk management |
-| **[Configuration](docs/configuration.md)** | All 29 `.env` parameters with defaults |
+| **[Configuration](docs/configuration.md)** | All 33 `.env` parameters with defaults |
 | **[Development Guide](docs/development-guide.md)** | Architecture, signal engine internals, concurrency, extension points |
-| **[Backlog](docs/backlog.md)** | Feature roadmap |
+| **[Changelog](CHANGELOG.md)** | Version history and fix log |
 
 ## Support the Developer
 

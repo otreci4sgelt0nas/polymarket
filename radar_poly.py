@@ -76,6 +76,7 @@ from trade_executor import (
     handle_buy, execute_close_market, close_all_positions, monitor_tp_sl,
     sync_positions,
 )
+from binance_api import reset_vwap_anchor
 from input_handler import sleep_with_key
 from session_stats import print_session_summary
 
@@ -93,7 +94,11 @@ MARKET_REFRESH_INTERVAL = 60  # seconds between market slug checks
 _session = requests.Session()
 
 # Persistent thread pool (avoid recreating every cycle)
-_executor = ThreadPoolExecutor(max_workers=2)
+# 4 workers: 2 for main loop price fetches + 2 reserved for monitor_tp_sl concurrency
+_executor = ThreadPoolExecutor(max_workers=4)
+
+# Cooldown after a completed auto-trade before another can fire (seconds)
+TRADE_COOLDOWN_SEC = float(os.getenv('TRADE_COOLDOWN_SEC', '30'))
 
 
 class PriceCache:
@@ -168,6 +173,8 @@ class TradingSession:
         self.last_beep = 0
         self.last_market_check = 0
         self.last_phase = ""
+        self.base_time_set_at = time.time()  # wall-clock when base_time was last set
+        self.last_trade_at = 0.0             # wall-clock of last completed auto-trade
 
         # Data history
         self.history = deque(maxlen=HISTORY_MAXLEN)
@@ -342,6 +349,7 @@ def main():
 
         session.last_market_check = time.time()
         session.base_time = time_remaining
+        session.base_time_set_at = time.time()  # Fix #3: anchor for drift-free countdown
 
         # Draw initial panel
         now_str = datetime.now().strftime("%H:%M:%S")
@@ -374,15 +382,18 @@ def main():
                         if new_slug != session.market_slug:
                             if session.positions:
                                 print(f"   {Y}{B}MARKET CHANGED → {new_slug} — clearing {len(session.positions)} old position(s){X}")
+                                # Fix #11: pass client + executor so on-chain sell is submitted
                                 total_pnl, cnt, session.session_pnl, pnl_list = close_all_positions(
                                     session.positions, session.token_up, session.token_down,
                                     radar_logger, "market_expired",
-                                    session.session_pnl, session.trade_history, get_price)
+                                    session.session_pnl, session.trade_history, get_price,
+                                    client=client, executor=_executor)
                                 session.trade_count += cnt
                                 for d, sh, ep, xp, pnl in pnl_list:
                                     pnl_color = G if pnl >= 0 else R
                                     print(f"   {Y}  expired {d.upper()} {sh:.0f}sh @ ${ep:.2f} → ${xp:.2f} {pnl_color}P&L: {'+' if pnl >= 0 else ''}${pnl:.2f}{X}")
                             session.history.clear()
+                            reset_vwap_anchor()  # Fix #8: reset session VWAP on new market window
                             # Fetch new Price to Beat
                             try:
                                 window_ts = int(new_slug.split('-')[-1])
@@ -395,6 +406,7 @@ def main():
                         session.token_up = new_token_up
                         session.token_down = new_token_down
                         session.base_time = time_remaining
+                        session.base_time_set_at = now  # Fix #3: anchor wall-clock for drift-free countdown
                         session.last_market_check = now
 
                         # Sync positions with platform (detect buys/sells made outside the radar)
@@ -424,8 +436,9 @@ def main():
                                      session.market_refresh_errors, e)
                         session.last_market_check = now
 
-                # Calculate decreasing time remaining
-                elapsed = (now - session.last_market_check) / 60
+                # Calculate decreasing time remaining anchored to when base_time was set
+                # (Fix #3: avoids drift/jumps caused by market refresh interval)
+                elapsed = (now - session.base_time_set_at) / 60
                 current_time = max(0, session.base_time - elapsed)
 
                 # Auto-recover WS if not running
@@ -604,6 +617,8 @@ def main():
                 # --- OPPORTUNITY DETECTED ---
                 # Use phase-dependent threshold (CLOSING phase = 999, blocks all)
                 effective_threshold = max(SIGNAL_STRENGTH_BEEP, phase_threshold)
+                # Fix #6: enforce cooldown between completed auto-trades
+                in_cooldown = session.last_trade_at > 0 and (now - session.last_trade_at) < TRADE_COOLDOWN_SEC
                 if SIGNAL_ENABLED and strength >= effective_threshold and s_dir != 'NEUTRAL' and sug:
                     phase_info = f" │ Phase: {current_phase}" if current_phase != 'MID' else ""
                     regime_info = f" │ Regime: {current_regime}" if current_regime != 'RANGE' else ""
@@ -614,9 +629,17 @@ def main():
                     print(f"   {W}   Amount: ${trade_amount:.0f} │ Trend: {trend:+.2f} │ SR: {sr_raw:+.1f}→{sr_adj:+.1f}{regime_info}{phase_info}{X}")
                     print(f"   {color}{B}{'═' * 55}{X}")
 
-                    # Guard: don't stack into an existing open position
-                    if session.positions:
+                    # Guards: cooldown, open position, insufficient balance
+                    if in_cooldown:
+                        cooldown_left = int(TRADE_COOLDOWN_SEC - (now - session.last_trade_at))
+                        print(f"   {D}Signal skipped — cooldown ({cooldown_left}s remaining).{X}")
+                        session.last_beep = time.time()
+                    elif session.positions:
                         print(f"   {D}Signal skipped — position already open.{X}")
+                        session.last_beep = time.time()
+                    # Fix #4: guard against insufficient balance before even counting down
+                    elif session.balance < trade_amount:
+                        print(f"   {Y}Signal skipped — insufficient balance (${session.balance:.2f} < ${trade_amount:.0f}).{X}")
                         session.last_beep = time.time()
                     else:
                         # 3-second countdown before auto-firing.
@@ -655,40 +678,53 @@ def main():
                                 tp = min(real_entry + (sug['tp'] - sug['entry']), TP_MAX_PRICE)
                                 sl = max(real_entry - (sug['entry'] - sug['sl']), SL_MIN_PRICE)
                                 token_id = session.token_up if trade_dir == 'up' else session.token_down
-                                tp_above = tp > real_entry
-                                sl_above = sl < real_entry
+                                # Fix #1: tp_above = price must rise to hit TP (long trade)
+                                #          sl_below = price must fall to hit SL (long trade)
+                                # For an UP token: TP is above entry, SL is below entry.
+                                # monitor_tp_sl uses tp_above to decide comparison direction.
+                                tp_above = tp > real_entry   # True for normal long
+                                sl_above = sl > real_entry   # True only if SL is above entry (inverted/short), normally False
+
+                                # Fix #10: supply a time_remaining callback so monitor exits on market expiry
+                                def _time_remaining_fn():
+                                    return max(0.0, session.base_time - (time.time() - session.base_time_set_at) / 60)
 
                                 print(f"   {M}{B}⏳ Monitoring TP ${tp:.2f} / SL ${sl:.2f}...{X}")
                                 print()
-                                reason, exit_price = monitor_tp_sl(
+                                exit_reason, exit_price = monitor_tp_sl(
                                     token_id, tp, sl, tp_above, sl_above,
-                                    get_price, _executor)
+                                    get_price, _executor,
+                                    time_remaining_fn=_time_remaining_fn)
 
                                 print()
-                                if reason == 'TP':
+                                if exit_reason == 'TP':
                                     exit_color = G
-                                elif reason == 'CANCEL':
+                                elif exit_reason == 'CANCEL':
                                     exit_color = Y
                                 else:
                                     exit_color = R
-                                print(f"   {exit_color}{B}⚡ {reason} @ ${exit_price:.2f}! Closing...{X}")
+                                print(f"   {exit_color}{B}⚡ {exit_reason} @ ${exit_price:.2f}! Closing...{X}")
                                 close_msg = execute_close_market(
                                     client, session.token_up, session.token_down,
                                     get_price, _executor)
                                 print(f"   {close_msg}")
                                 pnl = (exit_price - real_entry) * info['shares']
                                 session.session_pnl += pnl
+                                # Fix #2: increment trade_count here (on close) and NOT in handle_buy,
+                                # keeping the count as "completed round-trips" consistently.
                                 session.trade_count += 1
                                 session.trade_history.append(pnl)
                                 radar_logger.log_trade("CLOSE", trade_dir, info['shares'], exit_price,
-                                                       info['shares'] * exit_price, reason.lower(),
+                                                       info['shares'] * exit_price, exit_reason.lower(),
                                                        pnl, session.session_pnl)
                                 pnl_color = G if pnl >= 0 else R
-                                session.last_action = f"{exit_color}{B}{reason}{X} @ ${exit_price:.2f} │ {pnl_color}P&L: {'+' if pnl >= 0 else ''}${pnl:.2f}{X}"
+                                session.last_action = f"{exit_color}{B}{exit_reason}{X} @ ${exit_price:.2f} │ {pnl_color}P&L: {'+' if pnl >= 0 else ''}${pnl:.2f}{X}"
                                 print(f"   {pnl_color}{B}P&L: {'+' if pnl >= 0 else ''}${pnl:.2f} │ Session: {'+' if session.session_pnl >= 0 else ''}${session.session_pnl:.2f} ({session.trade_count} trades){X}")
                                 session.balance += exit_price * info['shares']
                                 session.positions.clear()
-                                print(f"   {D}Returning to radar...{X}")
+                                # Fix #6: stamp last_trade_at so cooldown is enforced
+                                session.last_trade_at = time.time()
+                                print(f"   {D}Returning to radar... (cooldown {TRADE_COOLDOWN_SEC:.0f}s){X}")
                                 print()
                             else:
                                 session.last_action = f"{R}✗ BUY {trade_dir.upper()} FAILED{X}"

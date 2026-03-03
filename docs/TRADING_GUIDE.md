@@ -129,7 +129,7 @@ The radar emits **3 beeps** when it detects an opportunity:
 2. Defined direction (UP or DOWN)
 3. TP/SL suggestion generated
 
-**You have 10 seconds to accept with the `S` key.**
+Review the signal direction on screen, then press **`U`** (UP) or **`D`** (DOWN) to act on it manually. A **30-second cooldown** (`TRADE_COOLDOWN_SEC`) prevents back-to-back trades after each close.
 
 ### 4.2 Manual Entry
 At any time, press:
@@ -247,7 +247,7 @@ The radar continuously monitors all open positions and beeps when TP or SL level
 
 Press **C** to close all positions when alerted.
 
-**Signal-based TP/SL (for entries via S key):**
+**Signal-based TP/SL (for signal-prompted entries):**
 
 The TP spread scales with confidence:
 | Strength | TP Spread | Example (entry $0.50) |
@@ -323,10 +323,9 @@ UP:$0.55 DN:$0.45 │ RSI: 38↑ │ ▲ UP      72% │ VOL↑ │ T:+0.5⬆ �
 
 | Key | Action |
 |-----|--------|
-| **U** | Buy UP (manual) |
-| **D** | Buy DOWN (manual) |
-| **S** | Accept automatic signal (during alert) |
-| **C** | Close ALL positions (emergency) |
+| **U** | Buy UP (manual or signal-prompted) |
+| **D** | Buy DOWN (manual or signal-prompted) |
+| **C** | Close ALL positions / cancel current action |
 | **Q** | Shut down radar (closes positions + summary) |
 
 ---
@@ -365,11 +364,11 @@ The "Beat" shows the price BTC needs to be at **by the end of the window**:
    ├── Phase: MID
    └── BEEP BEEP BEEP
 
-2. Trader evaluates (10 seconds)
+2. Trader evaluates
    ├── Indicators aligned? ✅
    ├── Favorable regime? ✅
    ├── Enough time? ✅
-   └── Presses S
+   └── Presses U or D
 
 3. Automatic execution
    ├── Buy UP @ $0.52

@@ -287,8 +287,29 @@ def compute_macd(candles: list[dict], fast: int | None = None, slow: int | None 
     return macd_line, signal_line, histogram, hist_delta
 
 
+# Session-level VWAP anchor: accumulated across all candles since session start.
+# Keyed by the timestamp of the oldest candle seen, so it resets naturally on a
+# new trading window but NOT on every HTTP poll that only returns 20 candles.
+_vwap_anchor: dict = {
+    "cum_vol": 0.0,
+    "cum_tp_vol": 0.0,
+    "seen_timestamps": set(),
+}
+
+
+def reset_vwap_anchor() -> None:
+    """Reset the session VWAP anchor (call when a new market window starts)."""
+    _vwap_anchor["cum_vol"] = 0.0
+    _vwap_anchor["cum_tp_vol"] = 0.0
+    _vwap_anchor["seen_timestamps"] = set()
+
+
 def compute_vwap(candles: list[dict]) -> tuple[float, float, float]:
     """VWAP (Volume Weighted Average Price).
+
+    Accumulates volume/price data from the session-level anchor so that VWAP
+    is not artificially reset on each 20-candle HTTP poll window.
+    Call reset_vwap_anchor() when a new market window begins.
 
     Returns:
         vwap: VWAP price
@@ -298,24 +319,37 @@ def compute_vwap(candles: list[dict]) -> tuple[float, float, float]:
     if len(candles) < 3:
         return 0.0, 0.0, 0.0
 
-    cum_vol = 0.0
-    cum_tp_vol = 0.0
-    vwap_values = []
+    # Accumulate only candles not yet seen in the anchor
+    for c in candles:
+        ts = c.get("timestamp", 0)
+        if ts and ts not in _vwap_anchor["seen_timestamps"]:
+            typical = (c['high'] + c['low'] + c['close']) / 3
+            _vwap_anchor["cum_vol"] += c['volume']
+            _vwap_anchor["cum_tp_vol"] += typical * c['volume']
+            _vwap_anchor["seen_timestamps"].add(ts)
 
+    cum_vol = _vwap_anchor["cum_vol"]
+    cum_tp_vol = _vwap_anchor["cum_tp_vol"]
+
+    # Derive VWAP per-candle for slope calculation (use current window only)
+    local_cv = 0.0
+    local_ctv = 0.0
+    vwap_values = []
     for c in candles:
         typical = (c['high'] + c['low'] + c['close']) / 3
-        cum_vol += c['volume']
-        cum_tp_vol += typical * c['volume']
-        if cum_vol > 0:
-            vwap_values.append(cum_tp_vol / cum_vol)
+        local_cv += c['volume']
+        local_ctv += typical * c['volume']
+        if local_cv > 0:
+            vwap_values.append(local_ctv / local_cv)
         else:
             vwap_values.append(typical)
 
-    vwap = vwap_values[-1]
+    # Use session-anchored cumulative VWAP as the authoritative value
+    vwap = (cum_tp_vol / cum_vol) if cum_vol > 0 else vwap_values[-1]
     current = candles[-1]['close']
     price_vs_vwap = ((current - vwap) / vwap * 100) if vwap > 0 else 0.0
 
-    # VWAP slope (last 5 values)
+    # VWAP slope (last 5 values of the local window series)
     if len(vwap_values) >= 5:
         recent = vwap_values[-5:]
         slope = (recent[-1] - recent[0]) / recent[0] * 100 if recent[0] > 0 else 0

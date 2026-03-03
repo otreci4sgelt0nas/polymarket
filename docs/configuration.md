@@ -1,6 +1,6 @@
 # Configuration Reference
 
-All 32 parameters are configured via the `.env` file. Copy `.env.example` to `.env` and edit as needed.
+All 33 parameters are configured via the `.env` file. Copy `.env.example` to `.env` and edit as needed.
 
 ---
 
@@ -37,6 +37,7 @@ All 32 parameters are configured via the `.env` file. Copy `.env.example` to `.e
 | `SIGNAL_ENABLED` | Enable (1) or disable (0) signal opportunity beep + trade prompt | 1 |
 | `SIGNAL_STRENGTH_BEEP` | Min signal strength (0-100) to trigger opportunity beep | 50 |
 | `PRICE_BEAT_ALERT` | Beep when BTC price moves $X or more from Price to Beat (0 = disabled) | 80 |
+| `TRADE_COOLDOWN_SEC` | Seconds to wait after a trade closes before the signal block can fire again (0 = disabled) | 30 |
 
 ## Indicator Periods
 

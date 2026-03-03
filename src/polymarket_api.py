@@ -353,7 +353,7 @@ def monitor_order(client, order_id: str, interval: int = 3, timeout_sec: int = 3
             else:
                 print(f"\r   Status: {status} | {elapsed:.0f}s", end="", flush=True)
 
-        if status == "MATCHED":
+        if status in ("MATCHED", "FILLED"):
             # Re-query if size_matched == 0 (API race condition)
             if size_matched == 0 and original_size > 0:
                 time.sleep(2)

@@ -146,6 +146,7 @@ MarketConfig(asset=None, window_min=None)
 **Module-level state:**
 - `_session = requests.Session()` — persistent HTTP connection pool (TCP keep-alive)
 - `RSI_PERIOD`, `MACD_FAST`, `MACD_SLOW`, `MACD_SIGNAL`, `BB_PERIOD`, `BB_STD`, `ADX_PERIOD` — configurable via `.env`
+- `_vwap_anchor` — dict accumulating `cum_vol` and `cum_tp_vol` across all candle timestamps seen since session start, keyed by timestamp (deduped). Enables true session VWAP rather than a rolling 20-candle window.
 
 #### Functions
 
@@ -197,9 +198,14 @@ MarketConfig(asset=None, window_min=None)
 **`compute_vwap(candles) -> (vwap, price_vs_vwap, vwap_slope)`**
 - Cumulative VWAP: `sum(typical_price * volume) / sum(volume)`
 - Typical price = `(high + low + close) / 3`
+- Accumulates into `_vwap_anchor` using candle timestamps as dedup keys, so repeated polls build on previous data rather than restarting from the latest 20 candles.
 - `price_vs_vwap`: percentage deviation of current close from VWAP
 - `vwap_slope`: computed from last 5 VWAP values, normalized to `[-1.0, +1.0]`
 - Normalization factor: `slope * 50`, clamped
+
+**`reset_vwap_anchor() -> None`**
+- Clears `_vwap_anchor`, resetting the session VWAP accumulator.
+- Called by `radar_poly.py` each time a new market window begins so VWAP starts fresh from that window's open.
 
 **`compute_bollinger(candles, period, num_std) -> (upper, middle, lower, bandwidth, position, squeeze)`**
 - Middle = SMA of closes over `period`
@@ -360,7 +366,8 @@ Private Key (0x...)
 **`monitor_order(client, order_id, interval, timeout_sec, cancel_fn, quiet) -> (status, details)`**
 - Polling loop: checks order status every `interval` seconds
 - Handles API race condition: if status is `MATCHED` but `size_matched == 0`, waits 2s and re-queries
-- Terminal statuses: `FILLED` (MATCHED), `CANCELLED`, `TIMEOUT`
+- Accepts both `"MATCHED"` and `"FILLED"` as terminal success statuses — the CLOB API may return either; previously only `"MATCHED"` was handled, causing indefinite polling when the API returned `"FILLED"` directly
+- Terminal statuses: `FILLED` (MATCHED or FILLED), `CANCELLED`, `TIMEOUT`
 - Displays progress bar when `quiet=False`
 
 **`coerce_list(maybe_list)`**
@@ -457,7 +464,7 @@ This is a leaf module with no imports — it is imported by all other `src/` mod
 
 | Category | Constants |
 |---|---|
-| Signal weights | `W_MOMENTUM`, `W_DIVERGENCE`, `W_SR`, `W_MACD`, `W_VWAP`, `W_BB` |
+| Signal weights | `W_MOMENTUM`, `W_DIVERGENCE`, `W_SR`, `W_MACD`, `W_VWAP`, `W_BB` — must sum to `1.0 ± 0.01`; a `warnings.warn` fires at import time if they do not |
 | Volatility | `VOL_THRESHOLD`, `VOL_AMPLIFIER` |
 | Regime multipliers | `REGIME_CHOP_MULT`, `REGIME_TREND_BOOST`, `REGIME_COUNTER_MULT` |
 | Phase thresholds | `PHASE_EARLY_THRESHOLD`, `PHASE_MID_THRESHOLD`, `PHASE_LATE_THRESHOLD`, `PHASE_CLOSING_THRESHOLD` |
@@ -543,7 +550,7 @@ Line  8: ACTION  │ last action performed
 Line  9: SIGNAL  │ direction │ strength bar │ RSI │ trend │ MACD │ VWAP │ BB
 Line 10: ALERT   │ scenario detection / status message
 Line 11: ─── separator ───
-Line 12: hotkey legend (U/D/C/S/Q)
+Line 12: hotkey legend (U/D/C/Q)
 Line 13: ═══ separator ═══
 Line 14: column headers for scrolling log
 Line 15: blank
@@ -581,9 +588,10 @@ Line 15: blank
 - Returns list of `(direction, shares, price, action)` tuples describing changes (`action`: `'added'` or `'removed'`).
 - Called on startup and every 60s in the market refresh block.
 
-**`close_all_positions(positions, token_up, token_down, trade_logger, reason, session_pnl, trade_history, get_price) -> (total_pnl, count, session_pnl, pnl_list)`**
+**`close_all_positions(positions, token_up, token_down, trade_logger, reason, session_pnl, trade_history, get_price, client=None, executor=None) -> (total_pnl, count, session_pnl, pnl_list)`**
 - Closes all positions and calculates P&L for each.
 - `reason`: `'market_expired'`, `'emergency'`, `'exit'`, `'tp'`, `'sl'`, `'cancel'`
+- When `client` and `executor` are provided (market-expiry path and emergency close), calls `execute_close_market` first to submit the actual on-chain sell order before clearing local state. Previously, market-expiry closes only updated local state without ever selling on Polymarket.
 - Logs each close via `trade_logger.log_trade()`.
 - Clears `positions` list in place.
 
@@ -595,8 +603,9 @@ Line 15: blank
 - Closes all positions with 3 retry attempts.
 - For each token with shares >= 0.01: approve allowance → submit sell → monitor.
 
-**`monitor_tp_sl(token_id, tp, sl, tp_above, sl_above, get_price, executor, timeout_sec) -> (reason, price)`**
-- Monitors price until TP hit, SL hit, manual cancel (C key), or timeout.
+**`monitor_tp_sl(token_id, tp, sl, tp_above, sl_above, get_price, executor, timeout_sec, time_remaining_fn=None) -> (reason, price)`**
+- Monitors price until TP hit, SL hit, manual cancel (C key), timeout, or market expiry.
+- `time_remaining_fn`: optional zero-argument callable that returns seconds remaining in the current market window. When provided and it returns `<= 0`, the monitor returns `('EXPIRED', price)` immediately rather than waiting out the full `timeout_sec`. Wired in `radar_poly.py` via a lambda over `session.base_time` and `base_time_set_at`.
 - Uses concurrent price fetch + key checking for lower latency.
 - Displays live progress bar: `SL $0.42 [████████░░] TP $0.58 │ C=close`.
 
@@ -629,13 +638,18 @@ Encapsulates all mutable state for a trading session:
 
 | Category | Fields |
 |---|---|
-| Market state | `market_slug`, `token_up`, `token_down`, `price_to_beat`, `base_time` |
-| Trading state | `positions`, `balance`, `session_pnl`, `trade_count`, `trade_history`, `current_signal` |
+| Market state | `market_slug`, `token_up`, `token_down`, `price_to_beat`, `base_time`, `base_time_set_at` |
+| Trading state | `positions`, `balance`, `session_pnl`, `trade_count`, `trade_history`, `current_signal`, `last_trade_at` |
 | Alert state | `alert_active`, `alert_side`, `alert_price` |
 | UI state | `status_msg`, `status_clear_at`, `last_action`, `poly_latency_ms` |
 | Timing | `last_beep`, `last_market_check`, `last_phase` |
 | Data history | `history` (deque, maxlen=60) |
 | Error tracking | `binance_errors`, `market_refresh_errors` |
+
+**Notable field details:**
+- `base_time_set_at` — timestamp recorded once when `base_time` is first assigned for the current window. Used to compute `elapsed = now - base_time_set_at`, preventing the countdown from jumping on every 60-second market refresh.
+- `last_trade_at` — timestamp of the most recent trade close. The signal block skips while `now - last_trade_at < TRADE_COOLDOWN_SEC`.
+- `trade_count` — increments only on completed round-trip closes (open + close), never on positions that are still open at quit.
 
 **Methods:**
 - `set_status(msg, duration=3)` — set a temporary status message
@@ -654,15 +668,16 @@ The main event loop:
 5.  Display donation banner (20s countdown)
 6.  Connect to Polymarket (create_client)
 7.  Discover active market (find_current_market)
-8.  Fetch Price to Beat
+8.  Fetch Price to Beat; record `base_time_set_at`
 9.  Sync existing positions from platform (sync_positions)
-10. Start Binance WebSocket
+10. Start Binance WebSocket (ThreadPoolExecutor max_workers=4)
 11. Configure terminal (cbreak mode, scroll region)
-11. Main loop:
+12. Main loop:
     a. Auto-clear status messages after 3s
     b. Refresh market every 60s (with exponential backoff on errors)
     b1. Sync positions with platform (detect buys/sells from web UI)
     b2. Re-sync USDC balance via get_balance()
+    b3. Call reset_vwap_anchor() so VWAP restarts from the new window's open
     c. Auto-recover WebSocket if dead
     d. Collect Binance data (WS preferred, HTTP fallback)
        - On error: exponential backoff: delay = min(2 * 2^errors, 30)
@@ -674,14 +689,17 @@ The main event loop:
     j. Draw static panel (via ui_panel.draw_panel)
     k. Print scrolling log line (via ui_panel.format_scrolling_line)
     l. Check for opportunity (visual + optional beep via SIGNAL_ENABLED)
+       - Skip if balance < trade_amount (balance guard)
+       - Skip if now - last_trade_at < TRADE_COOLDOWN_SEC (cooldown guard)
     m. Handle price alerts (edge-triggered, via PRICE_ALERT_ENABLED)
     n. Mean Reversion Alert (MID + RSI extreme ≤15/≥85 + BB touch ≤0.10/≥0.90 + token < $0.70)
     o. Price Beat Alert (visual only, MID + $PRICE_BEAT_ALERT distance from PTB)
     p. Position Monitor (TP/SL alerts — TP: entry+$0.20 cap $0.55, SL: entry-$0.15 floor $0.05)
+       - monitor_tp_sl receives time_remaining_fn lambda → returns 'EXPIRED' when window ends
     q. Sleep with key checking (0.5s WS / 2s HTTP)
     r. Process hotkeys (U/D/C/Q)
-12. On exit: reset terminal, print session summary, log to CSV
-13. Finally: stop WS, shutdown executor, restore terminal settings
+13. On exit: reset terminal, print session summary, log to CSV
+14. Finally: stop WS, shutdown executor, restore terminal settings
 ```
 
 **Exponential backoff (Binance errors):**
