@@ -6,6 +6,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.2.0] — 2025
+
+### Fixed — Critical
+
+- **SL too tight for token volatility** (`signal_engine.py`)
+  Token price standard deviation across the session was $0.267, but `SL_DEFAULT` was only $0.06 — 4.4× narrower than normal market noise. This caused 5 of 6 SL exits to trigger within seconds of entry, stopped out by spread fluctuation rather than real reversals. `SL_DEFAULT` widened from `0.06` → `0.14`. `TP_BASE_SPREAD` widened proportionally from `0.05` → `0.10` to restore a positive R:R ratio. Both remain overridable via `.env`.
+
+- **`monitor_tp_sl` SL direction inverted** (`trade_executor.py`)
+  For a normal long trade (`sl_above = False`), the SL branch evaluated `price >= sl` which is always true for any token sitting above its stop — causing instant SL exits on the very first price tick. Corrected to `price <= sl` (price must fall to the SL level) and `sl_above` branch corrected symmetrically to `price >= sl` (price must rise to a stop set above entry, for short-side hedges).
+
+- **Orphan position at startup caused $5.09 loss** (`radar_poly.py`)
+  A position left over from a previous window (9.62 shares) was not tracked by the session. When the market resolved against it, the close was submitted too late and received $0.001 residual value. `sync_positions` at startup now pauses and presents a non-blocking timed prompt (auto-adopts after 10 seconds if unattended) so orphan shares are always detected, adopted, closed, or explicitly skipped before trading begins.
+
+### Fixed
+
+- **Revenge-trading spiral after consecutive SL exits** (`radar_poly.py`)
+  Session 3 logged 3 SL exits in 5 minutes ($0.45 + $0.39 + $0.84 = $1.68 lost). A new `LOSS_COOLDOWN_SEC` (default `120s`, configurable via `.env`) lockout is stamped on every SL exit via `session.last_sl_at`. Any signal that fires during the loss cooldown is blocked and logged with a red `SKIP — loss cooldown (Xs left)` message. This is enforced separately from the existing 30s `TRADE_COOLDOWN_SEC`.
+
+- **Phase thresholds blocked almost all trades** (`signal_engine.py`)
+  `PHASE_EARLY_THRESHOLD` was 50 (first ~10 min of a 15m window) and `PHASE_LATE_THRESHOLD` was 70 (last ~5 min), leaving only the narrow MID phase with a reachable threshold of 30. Only 0.1% of signal rows across the full session reached strength ≥ 50. Thresholds lowered: EARLY `50` → `35`, LATE `70` → `50`.
+
+- **`suggestion` object not generated below strength 30** (`signal_engine.py`)
+  Signals scoring 20–29 had a populated direction but `suggestion = None`, silently blocking the execution gate even when thresholds were met. Lowered suggestion generation threshold from `30` → `20`.
+
+- **`execute_close_market` early-exits on API lag** (`trade_executor.py`)
+  On the very first iteration, `get_token_position` could return 0 due to a momentary API blip, causing the function to return "No positions" without submitting any sell order. Added a first-iteration retry: if both balances are zero on iteration 0, the function sleeps 1 second and retries before concluding no position exists.
+
+### Improved
+
+- **Skip-reason logging every cycle** (`radar_poly.py`)
+  Every cycle where a non-neutral signal is suppressed, the scroll log now prints the exact reason: phase threshold, CHOP regime, loss cooldown, trade cooldown, open position, or insufficient balance. Turns post-session debugging from guesswork into a 2-second log review.
+
+- **Orphan position prompt is non-blocking** (`radar_poly.py`)
+  The startup orphan prompt uses a timed `select`/`kbhit` loop instead of `input()`. If no key is pressed within 10 seconds the bot auto-adopts the positions and continues — the bot never hangs unattended.
+
+---
+
 ## [1.1.0] — 2025
 
 ### Fixed — Critical

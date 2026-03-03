@@ -100,6 +100,10 @@ _executor = ThreadPoolExecutor(max_workers=4)
 # Cooldown after a completed auto-trade before another can fire (seconds)
 TRADE_COOLDOWN_SEC = float(os.getenv('TRADE_COOLDOWN_SEC', '30'))
 
+# Extra cooldown after an SL exit before another trade can fire (seconds)
+# Prevents revenge-trading spirals after consecutive losses
+LOSS_COOLDOWN_SEC = float(os.getenv('LOSS_COOLDOWN_SEC', '120'))
+
 
 class PriceCache:
     """TTL-based cache for get_price() to avoid duplicate HTTP calls."""
@@ -175,6 +179,7 @@ class TradingSession:
         self.last_phase = ""
         self.base_time_set_at = time.time()  # wall-clock when base_time was last set
         self.last_trade_at = 0.0             # wall-clock of last completed auto-trade
+        self.last_sl_at = 0.0                # wall-clock of last SL exit (loss cooldown)
 
         # Data history
         self.history = deque(maxlen=HISTORY_MAXLEN)
@@ -300,10 +305,63 @@ def main():
     changes = sync_positions(client, session.token_up, session.token_down,
                              session.positions, get_price)
     if changes:
-        print(f" {G}✓{X} Found {len(changes)} position(s):")
+        total_orphan_usd = sum(shares * price for _, shares, price, action in changes if action == 'added')
+        print(f" {Y}{B}⚠ WARNING: {len(changes)} ORPHAN POSITION(S) DETECTED (${total_orphan_usd:.2f} at risk){X}")
+        print()
         for direction, shares, price, action in changes:
             d_color = G if direction == 'up' else R
-            print(f"      {d_color}● {direction.upper()}{X} {shares:.0f}sh @ ${price:.2f} (from platform)")
+            print(f"      {d_color}● {direction.upper()}{X} {shares:.0f}sh @ ${price:.2f}  {D}(source: platform — not opened by this session){X}")
+        print()
+        print(f"   {Y}These shares were found on-chain but not tracked locally.{X}")
+        print(f"   {Y}If the market resolves against them before you close, the full{X}")
+        print(f"   {Y}position value will be lost (as happened with the $5.09 loss).{X}")
+        print()
+        print(f"   {W}Options:{X}")
+        print(f"   {G}  ENTER{X} = adopt positions (track them, radar will alert on TP/SL)")
+        print(f"   {R}  C     {X} = close them immediately before starting")
+        print(f"   {Y}  S     {X} = skip (ignore orphans, not tracked — RISKY)")
+        print()
+        # Non-blocking timed prompt — auto-adopts after 10s so the bot never hangs unattended
+        orphan_choice = ""
+        _auto_secs = 10
+        try:
+            for _i in range(_auto_secs, 0, -1):
+                sys.stdout.write(f"\r   {W}Your choice [ENTER=adopt / C=close / S=skip] — auto-adopt in {_i}s...{X}  ")
+                sys.stdout.flush()
+                time.sleep(1)
+                # Check for a keypress each second (non-blocking)
+                if not IS_WINDOWS:
+                    import select
+                    if select.select([sys.stdin], [], [], 0)[0]:
+                        orphan_choice = sys.stdin.readline().strip().lower()
+                        break
+                else:
+                    import msvcrt
+                    if msvcrt.kbhit():
+                        orphan_choice = msvcrt.getch().decode('utf-8', errors='ignore').lower()
+                        break
+            sys.stdout.write("\r" + " " * 70 + "\r")
+            sys.stdout.flush()
+        except (EOFError, KeyboardInterrupt):
+            orphan_choice = ""
+
+        if orphan_choice == 'c':
+            print(f"   {R}{B}Closing orphan positions...{X}")
+            from trade_executor import execute_close_market
+            from concurrent.futures import ThreadPoolExecutor as _TPE
+            with _TPE(max_workers=2) as _tmp_exec:
+                msg = execute_close_market(client, session.token_up, session.token_down,
+                                           get_price, _tmp_exec)
+            print(f"   {msg}")
+            session.positions.clear()
+            print(f"   {G}✓ Orphan positions closed. Starting clean.{X}")
+        elif orphan_choice == 's':
+            session.positions.clear()
+            print(f"   {Y}⚠ Orphan positions ignored — they are NOT tracked. Close manually if needed.{X}")
+        else:
+            # Default: adopt — keep them in session.positions (already added by sync_positions)
+            print(f"   {G}✓ Adopted {len(changes)} position(s) — radar will monitor TP/SL.{X}")
+        print()
     else:
         print(f" {D}─{X} No existing positions")
 
@@ -619,6 +677,30 @@ def main():
                 effective_threshold = max(SIGNAL_STRENGTH_BEEP, phase_threshold)
                 # Fix #6: enforce cooldown between completed auto-trades
                 in_cooldown = session.last_trade_at > 0 and (now - session.last_trade_at) < TRADE_COOLDOWN_SEC
+                # Loss cooldown: extra lockout after an SL exit to prevent revenge-trading
+                in_loss_cooldown = session.last_sl_at > 0 and (now - session.last_sl_at) < LOSS_COOLDOWN_SEC
+
+                # Log why a non-neutral signal was suppressed (scroll log, every cycle)
+                if SIGNAL_ENABLED and s_dir != 'NEUTRAL' and strength > 0:
+                    if current_phase == 'CLOSING':
+                        print(f"   {D}{now_str} │ {Y}SKIP {sym}{s_dir} {strength}%{X}{D} — CLOSING phase (no trades in final window){X}")
+                    elif current_regime == 'CHOP':
+                        print(f"   {D}{now_str} │ {Y}SKIP {sym}{s_dir} {strength}%{X}{D} — CHOP regime (score halved, need {effective_threshold}%){X}")
+                    elif not sug:
+                        print(f"   {D}{now_str} │ {Y}SKIP {sym}{s_dir} {strength}%{X}{D} — strength < 20, no suggestion generated{X}")
+                    elif strength < effective_threshold:
+                        print(f"   {D}{now_str} │ {Y}SKIP {sym}{s_dir} {strength}%{X}{D} — below {current_phase} threshold ({effective_threshold}%){X}")
+                    elif in_loss_cooldown:
+                        loss_left = int(LOSS_COOLDOWN_SEC - (now - session.last_sl_at))
+                        print(f"   {D}{now_str} │ {R}SKIP {sym}{s_dir} {strength}%{X}{D} — loss cooldown ({loss_left}s left){X}")
+                    elif in_cooldown:
+                        cooldown_left = int(TRADE_COOLDOWN_SEC - (now - session.last_trade_at))
+                        print(f"   {D}{now_str} │ {Y}SKIP {sym}{s_dir} {strength}%{X}{D} — cooldown ({cooldown_left}s left){X}")
+                    elif session.positions:
+                        print(f"   {D}{now_str} │ {Y}SKIP {sym}{s_dir} {strength}%{X}{D} — position already open{X}")
+                    elif session.balance < trade_amount:
+                        print(f"   {D}{now_str} │ {Y}SKIP {sym}{s_dir} {strength}%{X}{D} — insufficient balance (${session.balance:.2f} < ${trade_amount:.0f}){X}")
+
                 if SIGNAL_ENABLED and strength >= effective_threshold and s_dir != 'NEUTRAL' and sug:
                     phase_info = f" │ Phase: {current_phase}" if current_phase != 'MID' else ""
                     regime_info = f" │ Regime: {current_regime}" if current_regime != 'RANGE' else ""
@@ -629,17 +711,16 @@ def main():
                     print(f"   {W}   Amount: ${trade_amount:.0f} │ Trend: {trend:+.2f} │ SR: {sr_raw:+.1f}→{sr_adj:+.1f}{regime_info}{phase_info}{X}")
                     print(f"   {color}{B}{'═' * 55}{X}")
 
-                    # Guards: cooldown, open position, insufficient balance
-                    if in_cooldown:
-                        cooldown_left = int(TRADE_COOLDOWN_SEC - (now - session.last_trade_at))
-                        print(f"   {D}Signal skipped — cooldown ({cooldown_left}s remaining).{X}")
+                    # Guards: loss cooldown, cooldown, open position, insufficient balance
+                    # (These are already logged above in the skip-reason block; just beep-gate here)
+                    if in_loss_cooldown:
+                        session.last_beep = time.time()
+                    elif in_cooldown:
                         session.last_beep = time.time()
                     elif session.positions:
-                        print(f"   {D}Signal skipped — position already open.{X}")
                         session.last_beep = time.time()
                     # Fix #4: guard against insufficient balance before even counting down
                     elif session.balance < trade_amount:
-                        print(f"   {Y}Signal skipped — insufficient balance (${session.balance:.2f} < ${trade_amount:.0f}).{X}")
                         session.last_beep = time.time()
                     else:
                         # 3-second countdown before auto-firing.
@@ -724,6 +805,10 @@ def main():
                                 session.positions.clear()
                                 # Fix #6: stamp last_trade_at so cooldown is enforced
                                 session.last_trade_at = time.time()
+                                # Stamp last_sl_at on SL exit to trigger loss cooldown
+                                if exit_reason == 'SL':
+                                    session.last_sl_at = time.time()
+                                    print(f"   {R}Loss cooldown active — no new trades for {LOSS_COOLDOWN_SEC:.0f}s{X}")
                                 print(f"   {D}Returning to radar... (cooldown {TRADE_COOLDOWN_SEC:.0f}s){X}")
                                 print()
                             else:

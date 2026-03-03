@@ -205,7 +205,13 @@ def execute_close_market(client, token_up, token_down, get_price, executor):
         if shares_up < 0.01 and shares_down < 0.01:
             if results:
                 return f"{G}✓ CLOSED! {', '.join(results)} | Total: ${total_value:.2f}{X}"
-            return f"{G}✓ No positions{X}"
+            # Only declare "no positions" after at least one retry, to guard against
+            # API lag returning 0 on the very first query when shares actually exist.
+            if _ > 0:
+                return f"{G}✓ No positions{X}"
+            # First iteration returned zero — sleep briefly and retry once more
+            time.sleep(1)
+            continue
 
         for token_id, shares, name in [(token_up, shares_up, "UP"), (token_down, shares_down, "DOWN")]:
             if shares < 0.01:
@@ -299,9 +305,9 @@ def monitor_tp_sl(token_id, tp, sl, tp_above, sl_above, get_price, executor,
         if not tp_above and price <= tp:
             return 'TP', price
 
-        if sl_above and price <= sl:
+        if sl_above and price >= sl:
             return 'SL', price
-        if not sl_above and price >= sl:
+        if not sl_above and price <= sl:
             return 'SL', price
 
         dist_tp = abs(tp - price)

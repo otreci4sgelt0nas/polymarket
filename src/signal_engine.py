@@ -34,9 +34,9 @@ REGIME_TREND_BOOST = float(os.getenv('REGIME_TREND_BOOST', '1.15'))
 REGIME_COUNTER_MULT = float(os.getenv('REGIME_COUNTER_MULT', '0.70'))
 
 # Phase thresholds
-PHASE_EARLY_THRESHOLD = int(os.getenv('PHASE_EARLY_THRESHOLD', '50'))
+PHASE_EARLY_THRESHOLD = int(os.getenv('PHASE_EARLY_THRESHOLD', '35'))
 PHASE_MID_THRESHOLD = int(os.getenv('PHASE_MID_THRESHOLD', '30'))
-PHASE_LATE_THRESHOLD = int(os.getenv('PHASE_LATE_THRESHOLD', '70'))
+PHASE_LATE_THRESHOLD = int(os.getenv('PHASE_LATE_THRESHOLD', '50'))
 PHASE_CLOSING_THRESHOLD = 999
 
 # Signal computation thresholds
@@ -45,10 +45,10 @@ DIVERGENCE_LOOKBACK = 6
 SR_LOOKBACK = 20
 
 # TP/SL defaults (used for signal suggestions)
-TP_BASE_SPREAD = 0.05
+TP_BASE_SPREAD = 0.10
 TP_STRENGTH_SCALE = 0.10
 TP_MAX_PRICE = 0.95
-SL_DEFAULT = 0.06
+SL_DEFAULT = 0.14
 SL_MIN_PRICE = 0.03
 
 
@@ -226,7 +226,7 @@ def compute_signal(up_buy, down_buy, btc_price, binance, history, regime='RANGE'
     strength = int(abs(score) * 100)
 
     suggestion = None
-    if strength >= 30:
+    if strength >= 20:
         if direction == 'UP':
             entry = up_buy
         else:
