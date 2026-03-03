@@ -21,7 +21,7 @@ from binance_api import get_klines
 
 logger = logging.getLogger(__name__)
 
-MAX_CANDLES = 30
+MAX_CANDLES = 60
 RECONNECT_DELAY_BASE = 2
 RECONNECT_DELAY_MAX = 30
 

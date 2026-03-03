@@ -108,6 +108,16 @@ TRADE_COOLDOWN_SEC = float(os.getenv('TRADE_COOLDOWN_SEC', '30'))
 # Prevents revenge-trading spirals after consecutive losses
 LOSS_COOLDOWN_SEC = float(os.getenv('LOSS_COOLDOWN_SEC', '120'))
 
+# Maximum session loss (USD) before auto-trading is suspended for the session.
+# Once session_pnl <= -MAX_SESSION_LOSS, all auto-trades are blocked.
+# Set to 0 to disable (no daily loss limit).
+MAX_SESSION_LOSS = float(os.getenv('MAX_SESSION_LOSS', '8'))
+
+# Block all auto-trades when regime is CHOP (like CLOSING phase).
+# CHOP halves signal scores but still lets trades through — historically
+# 33% of session time is CHOP and win rate in CHOP is poor.
+CHOP_BLOCK_TRADES = os.getenv('CHOP_BLOCK_TRADES', '1').lower() in ('1', 'true', 'yes')
+
 
 class PriceCache:
     """TTL-based cache for get_price() to avoid duplicate HTTP calls."""
@@ -658,9 +668,12 @@ def main():
 
                             mr_in_loss_cd = session.last_sl_at > 0 and (now - session.last_sl_at) < LOSS_COOLDOWN_SEC
                             mr_in_cd      = session.last_trade_at > 0 and (now - session.last_trade_at) < TRADE_COOLDOWN_SEC
+                            mr_loss_exceeded = MAX_SESSION_LOSS > 0 and session.session_pnl <= -MAX_SESSION_LOSS
 
                             if not SIGNAL_ENABLED:
                                 print(f"   {W}  Press {mr_color}{B}{mr_direction[0]}{X}{W} to buy or wait... (auto disabled){X}")
+                            elif mr_loss_exceeded:
+                                print(f"   {R}  MR skipped — max session loss hit (P&L ${session.session_pnl:.2f} ≤ -${MAX_SESSION_LOSS:.0f}){X}")
                             elif session.positions:
                                 print(f"   {D}  MR skipped — position already open{X}")
                             elif mr_in_loss_cd:
@@ -775,12 +788,18 @@ def main():
                 in_cooldown = session.last_trade_at > 0 and (now - session.last_trade_at) < TRADE_COOLDOWN_SEC
                 # Loss cooldown: extra lockout after an SL exit to prevent revenge-trading
                 in_loss_cooldown = session.last_sl_at > 0 and (now - session.last_sl_at) < LOSS_COOLDOWN_SEC
+                # Max session loss: suspend all auto-trades once session P&L hits the floor
+                session_loss_exceeded = MAX_SESSION_LOSS > 0 and session.session_pnl <= -MAX_SESSION_LOSS
 
                 # Log why a non-neutral signal was suppressed (scroll log, every cycle)
                 if SIGNAL_ENABLED and s_dir != 'NEUTRAL' and strength > 0:
-                    if current_phase == 'CLOSING':
+                    if session_loss_exceeded:
+                        print(f"   {D}{now_str} │ {R}SKIP {sym}{s_dir} {strength}%{X}{D} — max session loss hit (P&L ${session.session_pnl:.2f} ≤ -${MAX_SESSION_LOSS:.0f}){X}")
+                    elif current_phase == 'CLOSING':
                         print(f"   {D}{now_str} │ {Y}SKIP {sym}{s_dir} {strength}%{X}{D} — CLOSING phase (no trades in final window){X}")
-                    elif current_regime == 'CHOP':
+                    elif CHOP_BLOCK_TRADES and current_regime == 'CHOP':
+                        print(f"   {D}{now_str} │ {Y}SKIP {sym}{s_dir} {strength}%{X}{D} — CHOP regime (hard block){X}")
+                    elif not CHOP_BLOCK_TRADES and current_regime == 'CHOP':
                         print(f"   {D}{now_str} │ {Y}SKIP {sym}{s_dir} {strength}%{X}{D} — CHOP regime (score halved, need {effective_threshold}%){X}")
                     elif not sug:
                         print(f"   {D}{now_str} │ {Y}SKIP {sym}{s_dir} {strength}%{X}{D} — strength < 20, no suggestion generated{X}")
@@ -797,7 +816,9 @@ def main():
                     elif session.balance < trade_amount:
                         print(f"   {D}{now_str} │ {Y}SKIP {sym}{s_dir} {strength}%{X}{D} — insufficient balance (${session.balance:.2f} < ${trade_amount:.0f}){X}")
 
-                if SIGNAL_ENABLED and strength >= effective_threshold and s_dir != 'NEUTRAL' and sug:
+                if SIGNAL_ENABLED and strength >= effective_threshold and s_dir != 'NEUTRAL' and sug \
+                        and not session_loss_exceeded \
+                        and not (CHOP_BLOCK_TRADES and current_regime == 'CHOP'):
                     phase_info = f" │ Phase: {current_phase}" if current_phase != 'MID' else ""
                     regime_info = f" │ Regime: {current_regime}" if current_regime != 'RANGE' else ""
                     print()

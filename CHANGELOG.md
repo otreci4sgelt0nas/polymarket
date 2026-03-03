@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.3.0] — 2025
+
+### Fixed — Critical
+
+- **MACD still always zero despite v1.2.5 dedup fix** (`ws_binance.py`)
+  The v1.2.5 fix correctly deduplicates candles by timestamp inside `compute_macd`, but the root cause was never fully resolved: `MAX_CANDLES = 30` in `ws_binance.py` capped the WebSocket buffer at 30 candles, while the `.env` configuration specifies `MACD_SLOW=26` and `MACD_SIGNAL=9` — requiring a minimum of **35 unique candles** for any result. `len(closes) < slow + signal_period` was always true, causing `compute_macd` to return `(0.0, 0.0, 0.0, 0.0)` on every single tick. Confirmed 100% zero MACD across all 101,430 signal rows in the post-fix session data. Fixed by increasing `MAX_CANDLES` from `30` → `60`, providing a 25-candle safety margin above the 35-candle minimum. The 10% `W_MACD` weight is now live for the first time.
+
+### Added
+
+- **Hard CHOP regime block** (`radar_poly.py`)
+  CHOP was 33% of all session time in the v1.2.5 log data. The previous behaviour halved the signal score (`REGIME_CHOP_MULT=0.50`) but still allowed trades through when the dampened score cleared the phase threshold. Win rate in CHOP conditions is demonstrably poor. Added `CHOP_BLOCK_TRADES` (default `1`, configurable via `.env`). When enabled, CHOP is treated identically to CLOSING phase — all auto-trades (both signal and mean reversion paths) are unconditionally blocked. The skip log prints `SKIP — CHOP regime (hard block)` to distinguish from the old dampened-score skip. Set `CHOP_BLOCK_TRADES=0` to revert to the previous halved-score behaviour.
+
+- **Max session loss limit** (`radar_poly.py`)
+  Session 8 had 5 trades in 44 minutes, all after consecutive losses, ending at -$4.69. There was no mechanism to halt trading once a session drawdown reached a threshold. Added `MAX_SESSION_LOSS` (default `$8`, configurable via `.env`). Once `session_pnl <= -MAX_SESSION_LOSS`, all auto-trades on both the signal and mean reversion paths are suspended for the remainder of the session. The skip log prints in red: `SKIP — max session loss hit (P&L $X.XX ≤ -$8)`. Set `MAX_SESSION_LOSS=0` to disable. This acts as a hard daily loss limit independent of cooldowns.
+
+- **`SIGNAL_STRENGTH_MIN` and `CHOP_BLOCK_TRADES` documented in `.env.example`** (`.env.example`)
+  `SIGNAL_STRENGTH_MIN` existed in code since v1.2.2 but was absent from `.env.example`, making it invisible to operators. Added all three new risk management variables (`MAX_SESSION_LOSS`, `SIGNAL_STRENGTH_MIN`, `CHOP_BLOCK_TRADES`) under a new `── RISK MANAGEMENT ──` section in both `.env.example` and the live `.env`.
+
+---
+
 ## [1.2.5] — 2025
 
 ### Fixed — Critical
