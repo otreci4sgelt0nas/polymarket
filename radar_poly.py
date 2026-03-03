@@ -137,6 +137,14 @@ COUNTER_TREND_BLOCK = os.getenv('COUNTER_TREND_BLOCK', '1').lower() in ('1', 'tr
 # Set to 0 to disable (fall back to the flat $0.25 floor only).
 MIN_ENTRY_SL_RATIO = float(os.getenv('MIN_ENTRY_SL_RATIO', '0.40'))
 
+# Maximum entry price ceiling — blocks entries where TP room has compressed to near zero.
+# TP is capped at TP_MAX_PRICE=0.95. At entry=$0.90 the TP room is only $0.05 vs $0.14 SL
+# → R:R = 0.36:1. At entry=$0.86+ the market is near-resolved and there is no real upside.
+# Safe ceiling = TP_MAX_PRICE - TP_BASE_SPREAD = 0.95 - 0.10 = $0.85 (full TP room available).
+# 44% of the "passing" signals in the 88-min zero-trade session had entry > $0.75 (near-resolved).
+# Set to 0 to disable (no upper ceiling).
+MAX_ENTRY_PRICE = float(os.getenv('MAX_ENTRY_PRICE', '0.85'))
+
 
 class PriceCache:
     """TTL-based cache for get_price() to avoid duplicate HTTP calls."""
@@ -888,9 +896,16 @@ def main():
                         # MIN_ENTRY_SL_RATIO of entry price, the token has too little room
                         # (e.g. entry=$0.33, SL=$0.14 → 42% of entry needed to hit SL,
                         # meaning it's already deep in a move with minimal buffer left).
+                        # Upper ceiling guard: tokens above MAX_ENTRY_PRICE have compressed
+                        # TP room (capped at TP_MAX_PRICE=0.95) while SL room stays fixed,
+                        # collapsing R:R below 0.5:1 (e.g. entry=$0.90 → TP room=$0.05 vs SL=$0.14).
                         _sl_ratio = SL_DEFAULT / entry_price if entry_price > 0 else 1.0
+                        _tp_room = max(0.0, TP_MAX_PRICE - entry_price)
                         if entry_price < 0.25:
                             print(f"   {Y}Signal skipped — entry ${entry_price:.2f} below min $0.25 (too risky){X}")
+                            session.last_beep = time.time()
+                        elif MAX_ENTRY_PRICE > 0 and entry_price > MAX_ENTRY_PRICE:
+                            print(f"   {Y}Signal skipped — entry ${entry_price:.2f} above max ${MAX_ENTRY_PRICE:.2f} (TP room ${_tp_room:.2f} too compressed){X}")
                             session.last_beep = time.time()
                         elif MIN_ENTRY_SL_RATIO > 0 and _sl_ratio > MIN_ENTRY_SL_RATIO:
                             print(f"   {Y}Signal skipped — SL/entry ratio {_sl_ratio:.0%} > {MIN_ENTRY_SL_RATIO:.0%} max (entry ${entry_price:.2f} too low for ${SL_DEFAULT:.2f} SL){X}")

@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.3.2] — 2025
+
+### Fixed — Critical
+
+- **Near-resolved token entries passing all guards** (`radar_poly.py`)
+  Analysis of the 88-minute zero-trade session (20:40–22:08) revealed that 44% of the signals clearing v1.3.0 guards had `entry > $0.75` — tokens already priced at $0.86–$0.96, meaning the market is nearly settled. At `entry=$0.90`, TP is capped at `TP_MAX_PRICE=0.95`, leaving only `$0.05` TP room vs `$0.14` SL room → R:R of **0.35:1**. At `entry=$0.96` the TP suggestion actually inverts (`sug_tp - sug_entry = -$0.01`), producing a `tp_above=False` flag on a long trade — a silent monitor logic error. Added `MAX_ENTRY_PRICE` (default `$0.85`, configurable via `.env`). This is the safe ceiling: `TP_MAX_PRICE(0.95) − TP_BASE_SPREAD(0.10) = $0.85`, guaranteeing at least `$0.10` TP room on every entry. Skip log prints `entry $X.XX above max $0.85 (TP room $X.XX too compressed)`. Set `MAX_ENTRY_PRICE=0` to disable.
+
+### Investigated — Not a Bug
+
+- **88-minute session with 0 trades** — signal log ran continuously and was healthy throughout (no stale data, no CHOP saturation, BTC feed live). Under v1.3.0 guards (CHOP-only block), **11 distinct minute-windows** had qualifying signals with entry $0.25–$0.75, all guards clear (loss cooldown expired at 20:27, new session P&L=0, no open positions). Under v1.3.1 guards, **5 of those 11** pass (all TREND_DOWN aligned, entry $0.46–$0.85, TP room $0.10–$0.49). The zero-trade outcome was caused by something external — most likely `SIGNAL_ENABLED` toggled off, or a balance/API failure on the buy call. The signal/guard logic was functioning correctly. No code change required for this symptom.
+
+### Added
+
+- **`MAX_ENTRY_PRICE` documented in `.env` and `.env.example`** — new `MAX_ENTRY_PRICE=0.85` entry added under the risk management block in both files.
+
+---
+
 ## [1.3.1] — 2025
 
 ### Fixed — Critical
