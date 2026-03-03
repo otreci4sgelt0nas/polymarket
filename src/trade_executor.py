@@ -129,6 +129,12 @@ def close_all_positions(positions, token_up, token_down, trade_logger, reason,
     pnl_list = []
 
     for p in positions:
+        # Skip ghost positions — floating-point dust left after a TP/SL close can
+        # survive as a near-zero share count, producing a tiny negative pnl that
+        # inflates profit_factor (e.g. 703.28) and adds a spurious loss to the log.
+        if p.get('shares', 0) < 0.01:
+            logger.debug("close_all_positions: skipping ghost position %s (shares=%.4f)", p.get('direction'), p.get('shares', 0))
+            continue
         token_id = token_up if p['direction'] == 'up' else token_down
         try:
             exit_price = get_price(token_id, "SELL")

@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.2.2] — 2025
+
+### Fixed — Critical
+
+- **`SIGNAL_STRENGTH_BEEP` silently overriding all phase thresholds** (`radar_poly.py`)
+  `effective_threshold = max(SIGNAL_STRENGTH_BEEP, phase_threshold)` meant the audio beep setting (default 50) acted as the execution floor, completely overriding the phase thresholds of EARLY=35 and MID=30. Session 5 had 98 valid MID-phase TREND_DOWN signals (strength 30–49) — every single one was blocked. Introduced a new `SIGNAL_STRENGTH_MIN` variable (default `30`, configurable via `.env`) as the dedicated execution floor. `SIGNAL_STRENGTH_BEEP` now controls audio only and no longer participates in the execution gate. `effective_threshold = max(SIGNAL_STRENGTH_MIN, phase_threshold)`.
+
+- **Ghost position produces `profit_factor = 703.28` in sessions.csv** (`trade_executor.py`)
+  After a TP/SL close, floating-point dust (≈0.003 shares) could survive in the positions list and be passed to `close_all_positions` on market expiry. The ghost produced `pnl = (0.009 - 0.53) * 0.003 = -$0.00182` — logged as `-0.00`, counted as a loss by the `<= 0` check, but with `gross_losses = 0.00182` the profit factor calculated as `1.28 / 0.00182 = 703.28`. Added a `shares < 0.01` guard at the top of the `close_all_positions` loop, consistent with the same threshold used everywhere else in the codebase.
+
+### Improved
+
+- **Audio beep decoupled from execution** (`radar_poly.py`)
+  The beep now fires independently whenever `strength >= SIGNAL_STRENGTH_BEEP` (default 50) with a 5-second cooldown, giving audio feedback on strong signals regardless of whether the execution threshold is met.
+
+---
+
 ## [1.2.1] — 2025
 
 ### Fixed — Critical

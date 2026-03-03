@@ -84,6 +84,10 @@ from session_stats import print_session_summary
 PRICE_ALERT = float(os.getenv('PRICE_ALERT', '0.80'))
 PRICE_ALERT_ENABLED = os.getenv('PRICE_ALERT_ENABLED', '1').lower() in ('1', 'true', 'yes')
 SIGNAL_STRENGTH_BEEP = int(os.getenv('SIGNAL_STRENGTH_BEEP', '50'))
+# Minimum signal strength for trade execution — separate from the audio beep threshold.
+# Previously SIGNAL_STRENGTH_BEEP doubled as the execution floor via max(), which
+# silently overrode all phase thresholds (EARLY=35, MID=30) and blocked valid trades.
+SIGNAL_STRENGTH_MIN = int(os.getenv('SIGNAL_STRENGTH_MIN', '30'))
 SIGNAL_ENABLED = os.getenv('SIGNAL_ENABLED', '1').lower() in ('1', 'true', 'yes')
 TRADE_AMOUNT = float(os.getenv('TRADE_AMOUNT', '4'))
 PRICE_BEAT_ALERT = float(os.getenv('PRICE_BEAT_ALERT', '80'))
@@ -672,8 +676,16 @@ def main():
                             session.last_beep = now
 
                 # --- OPPORTUNITY DETECTED ---
-                # Use phase-dependent threshold (CLOSING phase = 999, blocks all)
-                effective_threshold = max(SIGNAL_STRENGTH_BEEP, phase_threshold)
+                # Execution threshold: phase_threshold sets the per-phase floor (EARLY=35,
+                # MID=30, LATE=50, CLOSING=999). SIGNAL_STRENGTH_MIN is a global execution
+                # floor (default 30). SIGNAL_STRENGTH_BEEP is audio-only and no longer
+                # participates in the execution gate.
+                effective_threshold = max(SIGNAL_STRENGTH_MIN, phase_threshold)
+
+                # Audio beep: separate from execution — fires whenever strength >= beep threshold
+                if strength >= SIGNAL_STRENGTH_BEEP and s_dir != 'NEUTRAL' and (now - session.last_beep) > 5:
+                    sys.stdout.write('\a')
+                    sys.stdout.flush()
                 # Fix #6: enforce cooldown between completed auto-trades
                 in_cooldown = session.last_trade_at > 0 and (now - session.last_trade_at) < TRADE_COOLDOWN_SEC
                 # Loss cooldown: extra lockout after an SL exit to prevent revenge-trading
