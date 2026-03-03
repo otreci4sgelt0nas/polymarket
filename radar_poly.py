@@ -118,6 +118,25 @@ MAX_SESSION_LOSS = float(os.getenv('MAX_SESSION_LOSS', '8'))
 # 33% of session time is CHOP and win rate in CHOP is poor.
 CHOP_BLOCK_TRADES = os.getenv('CHOP_BLOCK_TRADES', '1').lower() in ('1', 'true', 'yes')
 
+# Block all auto-trades when regime is RANGE (no trend confirmation at all).
+# RANGE has no multiplier — signal is taken at face value with no directional edge.
+# Log analysis: all RANGE-regime signal trades in last 2 sessions lost (0/2 win rate).
+# Set to 0 to allow RANGE trades (original behaviour).
+RANGE_BLOCK_TRADES = os.getenv('RANGE_BLOCK_TRADES', '1').lower() in ('1', 'true', 'yes')
+
+# Block counter-trend signals (e.g. DOWN signal when regime=TREND_UP).
+# Counter-trend trades are currently dampened 0.70× but still allowed through.
+# Log analysis: the 20:24 trade was DOWN in TREND_UP — weakest possible entry, lost.
+# Set to 0 to allow counter-trend trades with dampened score (original behaviour).
+COUNTER_TREND_BLOCK = os.getenv('COUNTER_TREND_BLOCK', '1').lower() in ('1', 'true', 'yes')
+
+# Minimum entry price as a fraction of SL room: entry_price × MIN_ENTRY_SL_RATIO >= SL_DEFAULT.
+# At entry=$0.33 with SL_DEFAULT=$0.14, the SL represents 42% of entry — token nearly
+# halves before SL triggers, implying it's already deep in a move with little room left.
+# Default 0.40 means entry must be >= SL_DEFAULT / 0.40 = $0.35 minimum effective floor.
+# Set to 0 to disable (fall back to the flat $0.25 floor only).
+MIN_ENTRY_SL_RATIO = float(os.getenv('MIN_ENTRY_SL_RATIO', '0.40'))
+
 
 class PriceCache:
     """TTL-based cache for get_price() to avoid duplicate HTTP calls."""
@@ -791,6 +810,17 @@ def main():
                 # Max session loss: suspend all auto-trades once session P&L hits the floor
                 session_loss_exceeded = MAX_SESSION_LOSS > 0 and session.session_pnl <= -MAX_SESSION_LOSS
 
+                # Counter-trend: signal direction opposes the confirmed regime trend
+                _trend_dir_up = current_regime == 'TREND_UP'
+                _trend_dir_dn = current_regime == 'TREND_DOWN'
+                is_counter_trend = COUNTER_TREND_BLOCK and (
+                    (_trend_dir_up and s_dir == 'DOWN') or
+                    (_trend_dir_dn and s_dir == 'UP')
+                )
+
+                # RANGE regime: no directional edge — signal taken at face value with no confirmation
+                is_range_blocked = RANGE_BLOCK_TRADES and current_regime == 'RANGE'
+
                 # Log why a non-neutral signal was suppressed (scroll log, every cycle)
                 if SIGNAL_ENABLED and s_dir != 'NEUTRAL' and strength > 0:
                     if session_loss_exceeded:
@@ -801,6 +831,10 @@ def main():
                         print(f"   {D}{now_str} │ {Y}SKIP {sym}{s_dir} {strength}%{X}{D} — CHOP regime (hard block){X}")
                     elif not CHOP_BLOCK_TRADES and current_regime == 'CHOP':
                         print(f"   {D}{now_str} │ {Y}SKIP {sym}{s_dir} {strength}%{X}{D} — CHOP regime (score halved, need {effective_threshold}%){X}")
+                    elif is_range_blocked:
+                        print(f"   {D}{now_str} │ {Y}SKIP {sym}{s_dir} {strength}%{X}{D} — RANGE regime (no trend confirmation, hard block){X}")
+                    elif is_counter_trend:
+                        print(f"   {D}{now_str} │ {Y}SKIP {sym}{s_dir} {strength}%{X}{D} — counter-trend ({s_dir} vs {current_regime}, hard block){X}")
                     elif not sug:
                         print(f"   {D}{now_str} │ {Y}SKIP {sym}{s_dir} {strength}%{X}{D} — strength < 20, no suggestion generated{X}")
                     elif strength < effective_threshold:
@@ -818,7 +852,9 @@ def main():
 
                 if SIGNAL_ENABLED and strength >= effective_threshold and s_dir != 'NEUTRAL' and sug \
                         and not session_loss_exceeded \
-                        and not (CHOP_BLOCK_TRADES and current_regime == 'CHOP'):
+                        and not (CHOP_BLOCK_TRADES and current_regime == 'CHOP') \
+                        and not is_range_blocked \
+                        and not is_counter_trend:
                     phase_info = f" │ Phase: {current_phase}" if current_phase != 'MID' else ""
                     regime_info = f" │ Regime: {current_regime}" if current_regime != 'RANGE' else ""
                     print()
@@ -848,8 +884,16 @@ def main():
                         # Minimum entry price guard: tokens below $0.25 have <25% implied
                         # win probability and only $0.22 of room before SL floor ($0.03),
                         # making losses disproportionately large (e.g. $0.17 → -$2.82).
+                        # Secondary SL-ratio guard: if SL_DEFAULT represents more than
+                        # MIN_ENTRY_SL_RATIO of entry price, the token has too little room
+                        # (e.g. entry=$0.33, SL=$0.14 → 42% of entry needed to hit SL,
+                        # meaning it's already deep in a move with minimal buffer left).
+                        _sl_ratio = SL_DEFAULT / entry_price if entry_price > 0 else 1.0
                         if entry_price < 0.25:
                             print(f"   {Y}Signal skipped — entry ${entry_price:.2f} below min $0.25 (too risky){X}")
+                            session.last_beep = time.time()
+                        elif MIN_ENTRY_SL_RATIO > 0 and _sl_ratio > MIN_ENTRY_SL_RATIO:
+                            print(f"   {Y}Signal skipped — SL/entry ratio {_sl_ratio:.0%} > {MIN_ENTRY_SL_RATIO:.0%} max (entry ${entry_price:.2f} too low for ${SL_DEFAULT:.2f} SL){X}")
                             session.last_beep = time.time()
                         else:
                             info, session.balance, session.last_action = handle_buy(

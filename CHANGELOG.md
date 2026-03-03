@@ -6,6 +6,36 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.3.1] — 2025
+
+### Fixed — Critical
+
+- **MACD still zero after v1.3.0 despite correct code** (`ws_binance.py`)
+  `MAX_CANDLES = 60` was committed while the bot was already running. `MAX_CANDLES` is a module-level constant — it only takes effect on process restart. The bot ran through the entire post-commit period without restarting, so all 2,864 post-v1.3.0 signal rows still show `macd_hist=0.0000`. No code change required — **this is resolved by restarting the bot**. Documented here so the next agent does not repeat the same investigation.
+
+### Added
+
+- **RANGE regime hard block** (`radar_poly.py`)
+  Log analysis of the last 2 sessions (sessions 10–11, 19:45–20:30) showed 0/2 win rate on RANGE-regime signal trades. RANGE provides no directional multiplier — the signal score is accepted at face value with zero trend confirmation. Both losing trades (20:07 DOWN str=39 and 20:24 DOWN str=30) were RANGE. Added `RANGE_BLOCK_TRADES` (default `1`, configurable via `.env`). When enabled, RANGE is treated as a hard block alongside CHOP and CLOSING. Skip log prints `SKIP — RANGE regime (no trend confirmation, hard block)`. Set `RANGE_BLOCK_TRADES=0` to revert to unconfirmed RANGE trades.
+
+- **Counter-trend hard block** (`radar_poly.py`)
+  The counter-trend multiplier (`REGIME_COUNTER_MULT=0.70`) dampens signal scores for trades against the confirmed trend direction but does not prevent execution. The 19:38 trade (DOWN signal in TREND_UP regime, str=45) and 20:24 trade (DOWN signal in TREND_UP, str=30) both lost. Added `COUNTER_TREND_BLOCK` (default `1`, configurable via `.env`). When enabled, any signal where direction opposes the confirmed trend (`DOWN` in `TREND_UP`, `UP` in `TREND_DOWN`) is unconditionally blocked. Skip log prints `SKIP — counter-trend (DOWN vs TREND_UP, hard block)`. Set `COUNTER_TREND_BLOCK=0` to revert to dampened-score counter-trend behaviour.
+
+- **SL-to-entry ratio floor** (`radar_poly.py`)
+  The existing flat $0.25 entry floor was necessary but insufficient. At entry=$0.33 with `SL_DEFAULT=$0.14`, the SL represents 42% of entry price — the token must nearly halve before the stop triggers, meaning it is already deep into a move with almost no buffer. The 20:24 trade (entry=$0.33, SL=$0.19) illustrates this: SL was hit exactly at the $0.19 floor in 67 seconds. Added `MIN_ENTRY_SL_RATIO` (default `0.40`, configurable via `.env`). If `SL_DEFAULT / entry_price > MIN_ENTRY_SL_RATIO`, the trade is rejected. At the default this enforces an effective minimum entry of `$0.14 / 0.40 = $0.35`, complementing the existing $0.25 floor. Skip log prints `SL/entry ratio 42% > 40% max`. Set `MIN_ENTRY_SL_RATIO=0` to disable.
+
+### Verified
+
+- All 4 losing signal trades from the last 2 sessions (20:07, 20:24, 14:56, 19:38) are blocked by the new guards. The 1 winning trade (20:01, str=60, TREND_DOWN) passes all guards cleanly.
+- Guard simulation output:
+  - `20:01 DOWN $0.45 str=60 TREND_DOWN` → ✓ PASS
+  - `20:07 DOWN $0.54 str=39 RANGE` → ✗ BLOCK (RANGE hard block)
+  - `20:24 DOWN $0.33 str=30 RANGE/TREND_UP` → ✗ BLOCK (RANGE hard block + SL ratio 42%)
+  - `14:56 DOWN $0.17 str=35 CHOP` → ✗ BLOCK (CHOP + $0.25 floor)
+  - `19:38 DOWN $0.58 str=45 TREND_UP` → ✗ BLOCK (counter-trend)
+
+---
+
 ## [1.3.0] — 2025
 
 ### Fixed — Critical
