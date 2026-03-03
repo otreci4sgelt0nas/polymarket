@@ -578,6 +578,19 @@ def main():
                     'ts': time.time(), 'up': up_buy, 'down': down_buy, 'btc': btc_price,
                 })
 
+                # Stale data guard: rsi=0 or bb_pos=0.0 means the Binance fetch
+                # returned a partial/failed result. Skip this cycle entirely rather
+                # than feeding garbage indicator values into the signal engine.
+                _rsi_val = binance_data.get('rsi', 0)
+                _bb_val  = binance_data.get('bb_pos', 0.5)
+                if _rsi_val == 0 or _bb_val == 0.0:
+                    now_str = datetime.now().strftime("%H:%M:%S")
+                    print(f"   {D}{now_str} │ {Y}Stale Binance data (RSI={_rsi_val:.0f} BB={_bb_val:.2f}) — skipping cycle{X}")
+                    key = sleep_with_key(2)
+                    if key == 'q':
+                        raise KeyboardInterrupt
+                    continue
+
                 # Compute signal (regime + phase aware)
                 session.current_signal = compute_signal(
                     up_buy, down_buy, btc_price, binance_data,
@@ -809,63 +822,71 @@ def main():
                         # Fire immediately — no countdown. Every millisecond of delay
                         # is slippage risk on a fast-moving binary market.
                         trade_dir = 'up' if s_dir == 'UP' else 'down'
+                        entry_price = up_buy if trade_dir == 'up' else down_buy
 
-                        info, session.balance, session.last_action = handle_buy(
-                            client, trade_dir, trade_amount, session.token_up, session.token_down,
-                            session.positions, session.balance, radar_logger,
-                            session.session_pnl, get_price, _executor, reason="signal")
-                        if info:
-                            real_entry = info['price']
-                            tp = min(real_entry + (sug['tp'] - sug['entry']), TP_MAX_PRICE)
-                            sl = max(real_entry - (sug['entry'] - sug['sl']), SL_MIN_PRICE)
-                            token_id = session.token_up if trade_dir == 'up' else session.token_down
-                            # tp_above = price must rise to hit TP (normal long)
-                            # sl_above = False for normal long (SL is below entry)
-                            tp_above = tp > real_entry
-                            sl_above = sl > real_entry
-
-                            def _time_remaining_fn():
-                                return max(0.0, session.base_time - (time.time() - session.base_time_set_at) / 60)
-
-                            print(f"   {M}{B}⏳ Monitoring TP ${tp:.2f} / SL ${sl:.2f}...{X}")
-                            print()
-                            exit_reason, exit_price = monitor_tp_sl(
-                                token_id, tp, sl, tp_above, sl_above,
-                                get_price, _executor,
-                                time_remaining_fn=_time_remaining_fn)
-
-                            print()
-                            if exit_reason == 'TP':
-                                exit_color = G
-                            elif exit_reason == 'CANCEL':
-                                exit_color = Y
-                            else:
-                                exit_color = R
-                            print(f"   {exit_color}{B}⚡ {exit_reason} @ ${exit_price:.2f}! Closing...{X}")
-                            close_msg = execute_close_market(
-                                client, session.token_up, session.token_down,
-                                get_price, _executor)
-                            print(f"   {close_msg}")
-                            pnl = (exit_price - real_entry) * info['shares']
-                            session.session_pnl += pnl
-                            session.trade_count += 1
-                            session.trade_history.append(pnl)
-                            radar_logger.log_trade("CLOSE", trade_dir, info['shares'], exit_price,
-                                                   info['shares'] * exit_price, exit_reason.lower(),
-                                                   pnl, session.session_pnl)
-                            pnl_color = G if pnl >= 0 else R
-                            session.last_action = f"{exit_color}{B}{exit_reason}{X} @ ${exit_price:.2f} │ {pnl_color}P&L: {'+' if pnl >= 0 else ''}${pnl:.2f}{X}"
-                            print(f"   {pnl_color}{B}P&L: {'+' if pnl >= 0 else ''}${pnl:.2f} │ Session: {'+' if session.session_pnl >= 0 else ''}${session.session_pnl:.2f} ({session.trade_count} trades){X}")
-                            session.balance += exit_price * info['shares']
-                            session.positions.clear()
-                            session.last_trade_at = time.time()
-                            if exit_reason == 'SL':
-                                session.last_sl_at = time.time()
-                                print(f"   {R}Loss cooldown active — no new trades for {LOSS_COOLDOWN_SEC:.0f}s{X}")
-                            print(f"   {D}Returning to radar... (cooldown {TRADE_COOLDOWN_SEC:.0f}s){X}")
-                            print()
+                        # Minimum entry price guard: tokens below $0.25 have <25% implied
+                        # win probability and only $0.22 of room before SL floor ($0.03),
+                        # making losses disproportionately large (e.g. $0.17 → -$2.82).
+                        if entry_price < 0.25:
+                            print(f"   {Y}Signal skipped — entry ${entry_price:.2f} below min $0.25 (too risky){X}")
+                            session.last_beep = time.time()
                         else:
-                            session.last_action = f"{R}✗ BUY {trade_dir.upper()} FAILED{X}"
+                            info, session.balance, session.last_action = handle_buy(
+                                client, trade_dir, trade_amount, session.token_up, session.token_down,
+                                session.positions, session.balance, radar_logger,
+                                session.session_pnl, get_price, _executor, reason="signal")
+                            if info:
+                                real_entry = info['price']
+                                tp = min(real_entry + (sug['tp'] - sug['entry']), TP_MAX_PRICE)
+                                sl = max(real_entry - (sug['entry'] - sug['sl']), SL_MIN_PRICE)
+                                token_id = session.token_up if trade_dir == 'up' else session.token_down
+                                # tp_above = price must rise to hit TP (normal long)
+                                # sl_above = False for normal long (SL is below entry)
+                                tp_above = tp > real_entry
+                                sl_above = sl > real_entry
+
+                                def _time_remaining_fn():
+                                    return max(0.0, session.base_time - (time.time() - session.base_time_set_at) / 60)
+
+                                print(f"   {M}{B}⏳ Monitoring TP ${tp:.2f} / SL ${sl:.2f}...{X}")
+                                print()
+                                exit_reason, exit_price = monitor_tp_sl(
+                                    token_id, tp, sl, tp_above, sl_above,
+                                    get_price, _executor,
+                                    time_remaining_fn=_time_remaining_fn)
+
+                                print()
+                                if exit_reason == 'TP':
+                                    exit_color = G
+                                elif exit_reason == 'CANCEL':
+                                    exit_color = Y
+                                else:
+                                    exit_color = R
+                                print(f"   {exit_color}{B}⚡ {exit_reason} @ ${exit_price:.2f}! Closing...{X}")
+                                close_msg = execute_close_market(
+                                    client, session.token_up, session.token_down,
+                                    get_price, _executor)
+                                print(f"   {close_msg}")
+                                pnl = (exit_price - real_entry) * info['shares']
+                                session.session_pnl += pnl
+                                session.trade_count += 1
+                                session.trade_history.append(pnl)
+                                radar_logger.log_trade("CLOSE", trade_dir, info['shares'], exit_price,
+                                                       info['shares'] * exit_price, exit_reason.lower(),
+                                                       pnl, session.session_pnl)
+                                pnl_color = G if pnl >= 0 else R
+                                session.last_action = f"{exit_color}{B}{exit_reason}{X} @ ${exit_price:.2f} │ {pnl_color}P&L: {'+' if pnl >= 0 else ''}${pnl:.2f}{X}"
+                                print(f"   {pnl_color}{B}P&L: {'+' if pnl >= 0 else ''}${pnl:.2f} │ Session: {'+' if session.session_pnl >= 0 else ''}${session.session_pnl:.2f} ({session.trade_count} trades){X}")
+                                session.balance += exit_price * info['shares']
+                                session.positions.clear()
+                                session.last_trade_at = time.time()
+                                if exit_reason == 'SL':
+                                    session.last_sl_at = time.time()
+                                    print(f"   {R}Loss cooldown active — no new trades for {LOSS_COOLDOWN_SEC:.0f}s{X}")
+                                print(f"   {D}Returning to radar... (cooldown {TRADE_COOLDOWN_SEC:.0f}s){X}")
+                                print()
+                            else:
+                                session.last_action = f"{R}✗ BUY {trade_dir.upper()} FAILED{X}
 
                         session.last_beep = time.time()
 

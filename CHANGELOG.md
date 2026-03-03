@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.2.5] — 2025
+
+### Fixed — Critical
+
+- **MACD always zero across entire session** (`binance_api.py`)
+  The radar polls at 0.5s intervals but uses 1-minute candles. Within each 1-minute candle, all ~120 sub-second rows share the exact same `close` price. Feeding 20 identical closes into the EMA calculation produces `fast_ema == slow_ema` → `macd_hist = 0.0` on every single tick. Confirmed zero MACD across 84,843 signal rows (100% of the day). Fixed by deduplicating candles by timestamp inside `compute_macd` before computing EMAs, so only one close per completed candle is used. The 15% `W_MACD` weight is now live.
+
+- **Signal fired on stale Binance data (`rsi=0`, `bb_pos=0.0`)** (`radar_poly.py`)
+  A failed or partial Binance fetch can return `rsi=0` and `bb_pos=0.0` — confirmed in session logs (one trade had `rsi=0 bb=0.00`). The signal engine silently used these garbage values, producing a misdirected trade. Added a stale-data guard before `compute_signal`: if `rsi=0` or `bb_pos=0.0`, the cycle is skipped with a yellow log message and retried in 2 seconds.
+
+- **Signal auto-trade fired on sub-$0.25 tokens** (`radar_poly.py`)
+  Tokens priced below $0.25 carry <25% implied win probability and only ~$0.22 of room between entry and the SL floor ($0.03), making losses disproportionately large. The last session's worst trade was entry=$0.17 → exit=$0.05 → **-$2.82** on a $4 position. Added a minimum entry price guard (`>= 0.25`) to the signal execution path before `handle_buy` is called. The Mean Reversion alert already had a `< 0.70` upper guard; this adds the lower bound to both paths.
+
+---
+
 ## [1.2.2] — 2025
 
 ### Fixed — Critical

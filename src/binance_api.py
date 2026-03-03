@@ -253,6 +253,10 @@ def compute_macd(candles: list[dict], fast: int | None = None, slow: int | None 
         signal_line: signal line value
         histogram: MACD - signal
         hist_delta: change in histogram (momentum acceleration)
+
+    Note: deduplicates by candle timestamp so that multiple radar ticks within
+    the same 1-minute candle (which all share the same close price) don't collapse
+    the EMA difference to zero.
     """
     if fast is None:
         fast = MACD_FAST
@@ -260,7 +264,18 @@ def compute_macd(candles: list[dict], fast: int | None = None, slow: int | None 
         slow = MACD_SLOW
     if signal_period is None:
         signal_period = MACD_SIGNAL
-    closes = [c['close'] for c in candles]
+
+    # Deduplicate: keep only the last entry per candle timestamp so repeated
+    # sub-minute polls don't feed identical closes into the EMA calculation.
+    seen_ts: set = set()
+    unique_candles = []
+    for c in candles:
+        ts = c.get('timestamp', 0)
+        if ts not in seen_ts:
+            seen_ts.add(ts)
+            unique_candles.append(c)
+
+    closes = [c['close'] for c in unique_candles]
     if len(closes) < slow + signal_period:
         return 0.0, 0.0, 0.0, 0.0
 
