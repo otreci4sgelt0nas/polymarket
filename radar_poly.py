@@ -886,7 +886,7 @@ def main():
                                 print(f"   {D}Returning to radar... (cooldown {TRADE_COOLDOWN_SEC:.0f}s){X}")
                                 print()
                             else:
-                                session.last_action = f"{R}✗ BUY {trade_dir.upper()} FAILED{X}
+                                session.last_action = f"{R}✗ BUY {trade_dir.upper()} FAILED{X}"
 
                         session.last_beep = time.time()
 
