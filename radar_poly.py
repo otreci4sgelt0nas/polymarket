@@ -70,7 +70,7 @@ from polymarket_api import (
 from logger import RadarLogger
 from ws_binance import BinanceWS, HAS_WS
 from colors import G, R, Y, C, W, B, D, M, BL, X
-from signal_engine import compute_signal, get_market_phase, TP_MAX_PRICE, SL_MIN_PRICE
+from signal_engine import compute_signal, get_market_phase, TP_MAX_PRICE, SL_MIN_PRICE, TP_BASE_SPREAD, SL_DEFAULT
 from ui_panel import draw_panel, format_scrolling_line, HEADER_LINES
 from trade_executor import (
     handle_buy, execute_close_market, close_all_positions, monitor_tp_sl,
@@ -633,15 +633,87 @@ def main():
                         mr_direction = 'DOWN'   # overbought → expect reversal down
 
                     if mr_direction:
-                        token_price = up_buy if mr_direction == 'UP' else down_buy
-                        if token_price < 0.70:
+                        mr_token_price = up_buy if mr_direction == 'UP' else down_buy
+                        if mr_token_price < 0.70:
+                            mr_color = G if mr_direction == 'UP' else R
+                            mr_sym = '▲' if mr_direction == 'UP' else '▼'
                             sys.stdout.write('\a\a\a')
                             sys.stdout.flush()
-                            mr_color = G if mr_direction == 'UP' else R
                             print(f"   {mr_color}{B}{'═' * 55}{X}")
-                            print(f"   {mr_color}{B}  MEAN REVERSION → {mr_direction} │ RSI={rsi:.0f} BB={bb:.2f} │ ${token_price:.2f}{X}")
+                            print(f"   {mr_color}{B}  MEAN REVERSION {mr_sym} {mr_direction} │ RSI={rsi:.0f} BB={bb:.2f} │ ${mr_token_price:.2f}{X}")
                             print(f"   {W}  Token cheap + RSI extreme + Bollinger touch{X}")
-                            print(f"   {W}  Press {mr_color}{B}{mr_direction[0]}{X}{W} to buy or wait...{X}")
+
+                            mr_in_loss_cd = session.last_sl_at > 0 and (now - session.last_sl_at) < LOSS_COOLDOWN_SEC
+                            mr_in_cd      = session.last_trade_at > 0 and (now - session.last_trade_at) < TRADE_COOLDOWN_SEC
+
+                            if not SIGNAL_ENABLED:
+                                print(f"   {W}  Press {mr_color}{B}{mr_direction[0]}{X}{W} to buy or wait... (auto disabled){X}")
+                            elif session.positions:
+                                print(f"   {D}  MR skipped — position already open{X}")
+                            elif mr_in_loss_cd:
+                                loss_left = int(LOSS_COOLDOWN_SEC - (now - session.last_sl_at))
+                                print(f"   {D}  MR skipped — loss cooldown ({loss_left}s left){X}")
+                            elif mr_in_cd:
+                                cd_left = int(TRADE_COOLDOWN_SEC - (now - session.last_trade_at))
+                                print(f"   {D}  MR skipped — trade cooldown ({cd_left}s left){X}")
+                            elif session.balance < trade_amount:
+                                print(f"   {Y}  MR skipped — insufficient balance (${session.balance:.2f} < ${trade_amount:.0f}){X}")
+                            else:
+                                # All guards pass — fire immediately, same path as signal trades
+                                print(f"   {mr_color}{B}  AUTO-FIRING MR {mr_sym} {mr_direction}...{X}")
+                                print(f"   {mr_color}{B}{'═' * 55}{X}")
+                                mr_trade_dir = mr_direction.lower()
+                                mr_info, session.balance, session.last_action = handle_buy(
+                                    client, mr_trade_dir, trade_amount,
+                                    session.token_up, session.token_down,
+                                    session.positions, session.balance, radar_logger,
+                                    session.session_pnl, get_price, _executor, reason="mean_reversion")
+                                if mr_info:
+                                    mr_entry = mr_info['price']
+                                    mr_tp = min(mr_entry + TP_BASE_SPREAD + 0.05, TP_MAX_PRICE)
+                                    mr_sl = max(mr_entry - SL_DEFAULT, SL_MIN_PRICE)
+                                    mr_token_id = session.token_up if mr_trade_dir == 'up' else session.token_down
+                                    mr_tp_above = mr_tp > mr_entry
+                                    mr_sl_above = mr_sl > mr_entry
+
+                                    def _mr_time_remaining_fn():
+                                        return max(0.0, session.base_time - (time.time() - session.base_time_set_at) / 60)
+
+                                    print(f"   {M}{B}⏳ MR Monitoring TP ${mr_tp:.2f} / SL ${mr_sl:.2f}...{X}")
+                                    print()
+                                    mr_exit_reason, mr_exit_price = monitor_tp_sl(
+                                        mr_token_id, mr_tp, mr_sl, mr_tp_above, mr_sl_above,
+                                        get_price, _executor,
+                                        time_remaining_fn=_mr_time_remaining_fn)
+
+                                    print()
+                                    mr_exit_color = G if mr_exit_reason == 'TP' else (Y if mr_exit_reason == 'CANCEL' else R)
+                                    print(f"   {mr_exit_color}{B}⚡ MR {mr_exit_reason} @ ${mr_exit_price:.2f}! Closing...{X}")
+                                    mr_close_msg = execute_close_market(
+                                        client, session.token_up, session.token_down,
+                                        get_price, _executor)
+                                    print(f"   {mr_close_msg}")
+                                    mr_pnl = (mr_exit_price - mr_entry) * mr_info['shares']
+                                    session.session_pnl += mr_pnl
+                                    session.trade_count += 1
+                                    session.trade_history.append(mr_pnl)
+                                    radar_logger.log_trade("CLOSE", mr_trade_dir, mr_info['shares'],
+                                                           mr_exit_price, mr_info['shares'] * mr_exit_price,
+                                                           f"mr_{mr_exit_reason.lower()}", mr_pnl, session.session_pnl)
+                                    mr_pnl_color = G if mr_pnl >= 0 else R
+                                    session.last_action = f"{mr_exit_color}{B}MR {mr_exit_reason}{X} @ ${mr_exit_price:.2f} │ {mr_pnl_color}P&L: {'+' if mr_pnl >= 0 else ''}${mr_pnl:.2f}{X}"
+                                    print(f"   {mr_pnl_color}{B}P&L: {'+' if mr_pnl >= 0 else ''}${mr_pnl:.2f} │ Session: {'+' if session.session_pnl >= 0 else ''}${session.session_pnl:.2f} ({session.trade_count} trades){X}")
+                                    session.balance += mr_exit_price * mr_info['shares']
+                                    session.positions.clear()
+                                    session.last_trade_at = time.time()
+                                    if mr_exit_reason == 'SL':
+                                        session.last_sl_at = time.time()
+                                        print(f"   {R}Loss cooldown active — no new trades for {LOSS_COOLDOWN_SEC:.0f}s{X}")
+                                    print(f"   {D}Returning to radar... (cooldown {TRADE_COOLDOWN_SEC:.0f}s){X}")
+                                    print()
+                                else:
+                                    session.last_action = f"{R}✗ MR BUY {mr_direction} FAILED{X}"
+
                             print(f"   {mr_color}{B}{'═' * 55}{X}")
                             session.last_beep = now
 
