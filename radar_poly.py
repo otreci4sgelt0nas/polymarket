@@ -347,7 +347,6 @@ def main():
 
         if orphan_choice == 'c':
             print(f"   {R}{B}Closing orphan positions...{X}")
-            from trade_executor import execute_close_market
             from concurrent.futures import ThreadPoolExecutor as _TPE
             with _TPE(max_workers=2) as _tmp_exec:
                 msg = execute_close_market(client, session.token_up, session.token_down,

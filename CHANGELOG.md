@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.2.1] — 2025
+
+### Fixed — Critical
+
+- **`execute_close_market` UnboundLocalError at startup** (`radar_poly.py`)
+  A redundant `from trade_executor import execute_close_market` inside the orphan-position `if` block caused Python to treat the name as a local variable throughout the entire enclosing scope. Any code path that referenced `execute_close_market` before reaching that `import` line raised `UnboundLocalError: cannot access local variable 'execute_close_market' where it is not associated with a value`. This crashed the entire signal execution block, meaning **all trades after a buy fired ran completely unmonitored** — no TP, no SL, positions held until `market_expired`. Removed the redundant local import; the top-level import at L75 is sufficient.
+
+- **`monitor_tp_sl` polled BUY (ask) price instead of SELL (bid) price** (`trade_executor.py`)
+  The monitor fetched `get_price(token_id, "BUY")` on every tick, but the price you receive when closing is always the SELL (bid) side. Log analysis of the session confirmed all three post-v1.2.0 trades had the SELL price already below SL at sample #0, yet the monitor never triggered because it was comparing the SL against the higher ask price. All price fetches and fallback returns in `monitor_tp_sl` changed from `"BUY"` → `"SELL"`.
+
+---
+
 ## [1.2.0] — 2025
 
 ### Fixed — Critical

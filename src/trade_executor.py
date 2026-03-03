@@ -277,21 +277,24 @@ def monitor_tp_sl(token_id, tp, sl, tp_above, sl_above, get_price, executor,
             try:
                 tr = time_remaining_fn()
                 if tr <= 0:
-                    return 'EXPIRED', price if price > 0 else get_price(token_id, "BUY")
+                    return 'EXPIRED', price if price > 0 else get_price(token_id, "SELL")
             except Exception as e:
                 logger.debug("monitor_tp_sl time_remaining_fn error: %s", e)
 
         if time.time() - start > timeout_sec:
-            return 'TIMEOUT', price if price > 0 else get_price(token_id, "BUY")
-        # Fetch price concurrently while checking keys
-        fut_price = executor.submit(get_price, token_id, "BUY")
+            return 'TIMEOUT', price if price > 0 else get_price(token_id, "SELL")
+        # Fetch SELL price concurrently while checking keys.
+        # We use the SELL (bid) side because that is the price we actually receive
+        # when closing — using BUY (ask) was always higher than the real exit value,
+        # so SL comparisons fired too late or never.
+        fut_price = executor.submit(get_price, token_id, "SELL")
 
         # Check keys while waiting for price (5 × 0.1s = 0.5s)
         for _ in range(5):
             key = read_key_nb()
             if key == 'c':
                 fut_price.result()  # don't leak the future
-                return 'CANCEL', price if price > 0 else get_price(token_id, "BUY")
+                return 'CANCEL', price if price > 0 else get_price(token_id, "SELL")
             time.sleep(0.1)
 
         price = fut_price.result()
