@@ -149,31 +149,54 @@ MAX_ENTRY_PRICE = float(os.getenv('MAX_ENTRY_PRICE', '0.85'))
 
 
 class PriceCache:
-    """TTL-based cache for get_price() to avoid duplicate HTTP calls."""
+    """TTL-based cache for get_price() and order book imbalance (OBI) to avoid duplicate HTTP calls."""
 
     def __init__(self, ttl_sec=0.5):
         self._cache = {}
         self._ttl = ttl_sec
 
-    def get(self, token_id: str, side: str) -> float:
+    def get_both(self, token_id: str, side: str) -> tuple[float, float]:
         now = time.time()
         key = (token_id, side)
         if key in self._cache:
-            price, ts = self._cache[key]
+            price, obi, ts = self._cache[key]
             if now - ts < self._ttl:
-                return price
+                return price, obi
         try:
-            resp = _session.get(
-                f"{CLOB}/price",
-                params={"token_id": token_id, "side": side},
-                timeout=5,
-            )
-            price = float(resp.json()["price"])
-            self._cache[key] = (price, now)  # only cache successful fetches
-            return price
-        except (requests.RequestException, KeyError, ValueError) as e:
+            resp = _session.get(f"{CLOB}/book", params={"token_id": token_id}, timeout=5)
+            data = resp.json()
+            bids = data.get("bids", [])
+            asks = data.get("asks", [])
+
+            best_bid = float(bids[-1]["price"]) if bids else 0.0
+            best_ask = float(asks[-1]["price"]) if asks else 0.0
+
+            # The bot expects get_price(side="buy") to return the best bid (what it calls up_buy)
+            price = best_bid if side.lower() == "buy" else best_ask
+
+            top_bids = bids[-5:] if bids else []
+            top_asks = asks[-5:] if asks else []
+
+            bid_size = sum(float(b.get("size", 0)) for b in top_bids)
+            ask_size = sum(float(a.get("size", 0)) for a in top_asks)
+
+            obi = 0.0
+            if (bid_size + ask_size) > 0:
+                obi = (bid_size - ask_size) / (bid_size + ask_size)
+
+            self._cache[key] = (price, obi, now)
+
+            other_side = "sell" if side.lower() == "buy" else "buy"
+            other_price = best_ask if side.lower() == "buy" else best_bid
+            self._cache[(token_id, other_side)] = (other_price, obi, now)
+
+            return price, obi
+        except Exception as e:
             logger.debug("PriceCache fetch error for %s/%s: %s", token_id[:8], side, e)
-            return 0.0
+            return 0.0, 0.0
+
+    def get(self, token_id: str, side: str) -> float:
+        return self.get_both(token_id, side)[0]
 
     def invalidate(self):
         self._cache.clear()
@@ -605,10 +628,10 @@ def main():
                     continue
 
                 _poly_t0 = time.time()
-                fut_up = _executor.submit(get_price, session.token_up, "BUY")
-                fut_dn = _executor.submit(get_price, session.token_down, "BUY")
-                up_buy = fut_up.result()
-                down_buy = fut_dn.result()
+                fut_up = _executor.submit(_price_cache.get_both, session.token_up, "BUY")
+                fut_dn = _executor.submit(_price_cache.get_both, session.token_down, "BUY")
+                up_buy, up_obi = fut_up.result()
+                down_buy, down_obi = fut_dn.result()
                 session.poly_latency_ms = (time.time() - _poly_t0) * 1000
                 if up_buy <= 0:
                     now_str = datetime.now().strftime("%H:%M:%S")
@@ -654,7 +677,8 @@ def main():
                 # Compute signal (regime + phase aware)
                 session.current_signal = compute_signal(
                     up_buy, down_buy, btc_price, binance_data,
-                    session.history, regime=current_regime, phase=current_phase)
+                    session.history, regime=current_regime, phase=current_phase,
+                    up_obi=up_obi, down_obi=down_obi)
                 if not session.current_signal:
                     key = sleep_with_key(2)
                     if key == 'q':

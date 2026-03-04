@@ -13,9 +13,10 @@ W_SR = float(os.getenv('W_SUPPORT_RESISTANCE', '0.10'))
 W_MACD = float(os.getenv('W_MACD', '0.15'))
 W_VWAP = float(os.getenv('W_VWAP', '0.15'))
 W_BB = float(os.getenv('W_BOLLINGER', '0.10'))
+W_OBI = float(os.getenv('W_ORDERBOOK_IMBALANCE', '0.00'))
 
 # Validate weight sum at import time so misconfigured .env is caught early
-_WEIGHT_SUM = W_MOMENTUM + W_DIVERGENCE + W_SR + W_MACD + W_VWAP + W_BB
+_WEIGHT_SUM = W_MOMENTUM + W_DIVERGENCE + W_SR + W_MACD + W_VWAP + W_BB + W_OBI
 if abs(_WEIGHT_SUM - 1.0) > 0.01:
     import warnings
     warnings.warn(
@@ -78,8 +79,8 @@ def get_market_phase(time_remaining, window_min=15):
         return 'CLOSING', PHASE_CLOSING_THRESHOLD
 
 
-def compute_signal(up_buy, down_buy, btc_price, binance, history, regime='RANGE', phase='MID'):
-    """Compute scalp signal v3 - Trend-Following with MACD, VWAP, Bollinger.
+def compute_signal(up_buy, down_buy, btc_price, binance, history, regime='RANGE', phase='MID', up_obi=0.0, down_obi=0.0):
+    """Compute scalp signal v3 - Trend-Following with MACD, VWAP, Bollinger, and OBI.
 
     Note: caller must append to history before calling this function.
     """
@@ -208,6 +209,14 @@ def compute_signal(up_buy, down_buy, btc_price, binance, history, regime='RANGE'
         bb_score = max(-1.0, min(1.0, bb_score))
     score += bb_score * W_BB
 
+    # 7. ORDER BOOK IMBALANCE
+    obi_score = 0.0
+    if up_obi > 0.7:
+        obi_score = 1.0
+    elif down_obi > 0.7:
+        obi_score = -1.0
+    score += obi_score * W_OBI
+
     # VOLATILITY (amplifier)
     atr = binance.get('atr', 0)
     vol_pct = (atr / btc_price * 100) if btc_price > 0 else 0
@@ -229,7 +238,14 @@ def compute_signal(up_buy, down_buy, btc_price, binance, history, regime='RANGE'
     if score > SIGNAL_NEUTRAL_ZONE: direction = 'UP'
     elif score < -SIGNAL_NEUTRAL_ZONE: direction = 'DOWN'
     else: direction = 'NEUTRAL'
+
     strength = int(abs(score) * 100)
+
+    # OBI Boost logic
+    if direction == 'UP' and up_obi > 0.7:
+        strength = min(int(strength * 1.2), 100)
+    elif direction == 'DOWN' and down_obi > 0.7:
+        strength = min(int(strength * 1.2), 100)
 
     suggestion = None
     if strength >= 20:
