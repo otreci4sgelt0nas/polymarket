@@ -28,6 +28,7 @@ import time
 import logging
 import platform
 import shutil
+import threading
 import requests
 from datetime import datetime
 from collections import deque
@@ -76,6 +77,7 @@ from trade_executor import (
     handle_buy, execute_close_market, close_all_positions, monitor_tp_sl,
     sync_positions,
 )
+from delta_neutral_hunter import DeltaNeutralHunter, hunter_status_str, DN_ENABLED
 from binance_api import reset_vwap_anchor
 from input_handler import sleep_with_key
 from session_stats import print_session_summary
@@ -422,6 +424,24 @@ def main():
     else:
         print(f" {D}─{X} websocket-client not installed (HTTP only)")
 
+    # -- Delta-Neutral Hunter --
+    _print_lock = threading.Lock()
+    hunter = DeltaNeutralHunter(
+        create_client_fn=create_client,
+        get_price_fn=get_price,
+        radar_logger=radar_logger,
+        print_lock=_print_lock,
+    )
+    hunter.set_market(session.token_up, session.token_down)
+    if DN_ENABLED:
+        hunter_started = hunter.start()
+        if hunter_started:
+            print(f"   {M}◆ Delta-Neutral Hunter started{X} — threshold=${float(os.getenv('DN_THRESHOLD', '0.985')):.4f} stake=${float(os.getenv('DN_STAKE', '4')):.0f}/leg")
+        else:
+            print(f"   {D}◆ Delta-Neutral Hunter failed to start{X}")
+    else:
+        print(f"   {D}◆ Delta-Neutral Hunter disabled (DN_ENABLED=0){X}")
+
     print(f"   {G}Ready! Starting in 2s...{X}")
     time.sleep(2)
 
@@ -506,6 +526,8 @@ def main():
                         session.base_time = time_remaining
                         session.base_time_set_at = now  # Fix #3: anchor wall-clock for drift-free countdown
                         session.last_market_check = now
+                        # Update hunter with new market tokens so it scans the correct pair
+                        hunter.set_market(session.token_up, session.token_down)
 
                         # Sync positions with platform (detect buys/sells made outside the radar)
                         try:
@@ -655,7 +677,8 @@ def main():
                            ws_status=binance_ws.status,
                            price_to_beat=session.price_to_beat, trade_history=session.trade_history,
                            last_action=session.last_action, asset_name=config.display_name,
-                           poly_latency_ms=session.poly_latency_ms)
+                           poly_latency_ms=session.poly_latency_ms,
+                           hunter_str=hunter_status_str(hunter))
 
                 # -- SCROLLING LOG --
                 s_dir = session.current_signal['direction']
@@ -671,6 +694,33 @@ def main():
                 print(format_scrolling_line(now_str, btc_price, up_buy, down_buy,
                                             session.current_signal, session.positions,
                                             current_regime, asset_name=config.display_name))
+
+                # -- HUNTER STATUS LINE (every cycle, same scroll area) --
+                print(f"   {D}DN:{X} {hunter_status_str(hunter)}")
+
+                # -- DRAIN HUNTER RESULT QUEUE (log arb outcomes to CSV + scrolling log) --
+                while not hunter.result_queue.empty():
+                    try:
+                        arb = hunter.result_queue.get_nowait()
+                        if arb.status == "FILLED":
+                            _arb_pnl_color = G if arb.net_profit >= 0 else R
+                            print(
+                                f"   {M}{B}[DN ARB FILLED]{X} "
+                                f"UP {arb.shares_up:.0f}sh@${arb.fill_price_up:.4f} + "
+                                f"DN {arb.shares_dn:.0f}sh@${arb.fill_price_dn:.4f} │ "
+                                f"combined=${arb.combined:.4f} spread={arb.spread*100:.2f}% │ "
+                                f"{_arb_pnl_color}est.net ${arb.net_profit:+.4f}{X}"
+                            )
+                        elif arb.status == "PARTIAL":
+                            print(
+                                f"   {Y}{B}[DN PARTIAL]{X} {arb.note}"
+                            )
+                        elif arb.status == "FAILED":
+                            print(
+                                f"   {R}[DN FAILED]{X} {arb.note}"
+                            )
+                    except Exception:
+                        break
 
                 # --- MEAN REVERSION ALERT (MID + RSI extreme + BB touch + token cheap) ---
                 if current_phase == 'MID' and (now - session.last_beep) > 30:
@@ -740,6 +790,7 @@ def main():
                                     def _mr_time_remaining_fn():
                                         return max(0.0, session.base_time - (time.time() - session.base_time_set_at) / 60)
 
+                                    hunter.pause()
                                     print(f"   {M}{B}⏳ MR Monitoring TP ${mr_tp:.2f} / SL ${mr_sl:.2f}...{X}")
                                     print()
                                     mr_exit_reason, mr_exit_price = monitor_tp_sl(
@@ -770,9 +821,11 @@ def main():
                                     if mr_exit_reason == 'SL':
                                         session.last_sl_at = time.time()
                                         print(f"   {R}Loss cooldown active — no new trades for {LOSS_COOLDOWN_SEC:.0f}s{X}")
+                                    hunter.resume()
                                     print(f"   {D}Returning to radar... (cooldown {TRADE_COOLDOWN_SEC:.0f}s){X}")
                                     print()
                                 else:
+                                    hunter.resume()
                                     session.last_action = f"{R}✗ MR BUY {mr_direction} FAILED{X}"
 
                             print(f"   {mr_color}{B}{'═' * 55}{X}")
@@ -936,6 +989,7 @@ def main():
                                 def _time_remaining_fn():
                                     return max(0.0, session.base_time - (time.time() - session.base_time_set_at) / 60)
 
+                                hunter.pause()
                                 print(f"   {M}{B}⏳ Monitoring TP ${tp:.2f} / SL ${sl:.2f}...{X}")
                                 print()
                                 exit_reason, exit_price = monitor_tp_sl(
@@ -971,9 +1025,11 @@ def main():
                                 if exit_reason == 'SL':
                                     session.last_sl_at = time.time()
                                     print(f"   {R}Loss cooldown active — no new trades for {LOSS_COOLDOWN_SEC:.0f}s{X}")
+                                hunter.resume()
                                 print(f"   {D}Returning to radar... (cooldown {TRADE_COOLDOWN_SEC:.0f}s){X}")
                                 print()
                             else:
+                                hunter.resume()
                                 session.last_action = f"{R}✗ BUY {trade_dir.upper()} FAILED{X}"
 
                         session.last_beep = time.time()
@@ -1000,7 +1056,8 @@ def main():
                                price_to_beat=session.price_to_beat,
                                trade_history=session.trade_history,
                                last_action=session.last_action, asset_name=config.display_name,
-                               poly_latency_ms=session.poly_latency_ms)
+                               poly_latency_ms=session.poly_latency_ms,
+                               hunter_str=hunter_status_str(hunter))
                 elif key == 'c':
                     # Show closing status in static panel
                     session.set_status(f"{Y}{B}EMERGENCY CLOSE...{X}", duration=5)
@@ -1016,7 +1073,8 @@ def main():
                                price_to_beat=session.price_to_beat,
                                trade_history=session.trade_history,
                                last_action=session.last_action, asset_name=config.display_name,
-                               poly_latency_ms=session.poly_latency_ms)
+                               poly_latency_ms=session.poly_latency_ms,
+                               hunter_str=hunter_status_str(hunter))
                     msg = execute_close_market(client, session.token_up, session.token_down,
                                               get_price, _executor)
                     if session.positions:
@@ -1044,7 +1102,8 @@ def main():
                                price_to_beat=session.price_to_beat,
                                trade_history=session.trade_history,
                                last_action=session.last_action, asset_name=config.display_name,
-                               poly_latency_ms=session.poly_latency_ms)
+                               poly_latency_ms=session.poly_latency_ms,
+                               hunter_str=hunter_status_str(hunter))
                 elif key == 'q':
                     raise KeyboardInterrupt
 
@@ -1085,6 +1144,8 @@ def main():
                     raise KeyboardInterrupt
 
     finally:
+        # Stop Delta-Neutral Hunter
+        hunter.stop()
         # Stop WebSocket
         binance_ws.stop()
         # Shutdown thread pool (wait=True to prevent resource leaks)

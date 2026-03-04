@@ -22,9 +22,9 @@ _session = requests.Session()
 
 # Configurable indicator periods
 RSI_PERIOD = int(os.getenv('RSI_PERIOD', '7'))
-MACD_FAST = int(os.getenv('MACD_FAST', '5'))
-MACD_SLOW = int(os.getenv('MACD_SLOW', '10'))
-MACD_SIGNAL = int(os.getenv('MACD_SIGNAL', '4'))
+MACD_FAST = int(os.getenv('MACD_FAST', '8'))
+MACD_SLOW = int(os.getenv('MACD_SLOW', '21'))
+MACD_SIGNAL = int(os.getenv('MACD_SIGNAL', '5'))
 BB_PERIOD = int(os.getenv('BB_PERIOD', '14'))
 BB_STD = float(os.getenv('BB_STD', '2'))
 ADX_PERIOD = int(os.getenv('ADX_PERIOD', '7'))

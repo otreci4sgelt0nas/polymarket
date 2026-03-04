@@ -20,7 +20,7 @@ def draw_panel(time_str, balance, btc_price, bin_direction, confidence, binance_
                session_pnl=0.0, trade_count=0, regime="", phase="",
                data_source="http", status_msg="", price_to_beat=0.0, ws_status="",
                trade_history=None, last_action="", asset_name="BTC",
-               poly_latency_ms=0):
+               poly_latency_ms=0, hunter_str=""):
     """Redraws the static panel at the top (HEADER_LINES lines).
     Uses StringIO buffer for single write+flush (reduces terminal I/O)."""
     w = shutil.get_terminal_size().columns
@@ -148,32 +148,33 @@ def draw_panel(time_str, balance, btc_price, bin_direction, confidence, binance_
     else:
         buf.write(f" {W}SIGNAL  {X}│ {D}Waiting for data...{X}")
 
-    # Line 10: Alert / Scenario
+    # Line 10: Alert / Scenario  [+ DN hunter status as right-hand suffix]
     scenario = detect_scenario(signal, regime, phase)
+    dn_suffix = f"  {hunter_str}" if hunter_str else ""
     buf.write(f"\033[10;1H\033[K")
     if status_msg:
-        buf.write(f" {Y}{B}STATUS  {X}│ {status_msg}")
+        buf.write(f" {Y}{B}STATUS  {X}│ {status_msg}{dn_suffix}")
     elif alert_active:
         alert_color = G if alert_side == "UP" else R
         scenario_str = ""
         if scenario:
             sc_name, sc_color, sc_warn = scenario
             scenario_str = f" │ {sc_color}{BL}{B}{sc_name}{X}"
-        buf.write(f" {Y}{B}ALERT   {X}│ {alert_color}{B}{alert_side} @ ${alert_price:.2f}{X} (>= ${PRICE_ALERT:.2f}){scenario_str}")
+        buf.write(f" {Y}{B}ALERT   {X}│ {alert_color}{B}{alert_side} @ ${alert_price:.2f}{X} (>= ${PRICE_ALERT:.2f}){scenario_str}{dn_suffix}")
     elif scenario:
         sc_name, sc_color, sc_warn = scenario
         if sc_warn:
-            buf.write(f" {Y}ALERT   {X}│ {sc_color}{BL}{B}⚠ {sc_name}{X}")
+            buf.write(f" {Y}ALERT   {X}│ {sc_color}{BL}{B}⚠ {sc_name}{X}{dn_suffix}")
         else:
-            buf.write(f" {G}ALERT   {X}│ {sc_color}{BL}{B}● {sc_name}{X}")
+            buf.write(f" {G}ALERT   {X}│ {sc_color}{BL}{B}● {sc_name}{X}{dn_suffix}")
     else:
-        buf.write(f" {D}ALERT   {X}│ {D}─{X}")
+        buf.write(f" {D}ALERT   {X}│ {D}─{X}{dn_suffix}")
 
     # Line 11: separator
     buf.write(f"\033[11;1H\033[K {'─' * (w - 2)}")
 
     # Line 12: Hotkeys
-    buf.write(f"\033[12;1H\033[K {W}{B}U{X}{D}=buy UP{X} │ {W}{B}D{X}{D}=buy DOWN{X} │ {W}{B}C{X}{D}=cancel/close{X} │ {W}{B}Q{X}{D}=exit{X}")
+    buf.write(f"\033[12;1H\033[K {W}{B}U{X}{D}=buy UP{X} │ {W}{B}D{X}{D}=buy DOWN{X} │ {W}{B}C{X}{D}=cancel/close{X} │ {W}{B}Q{X}{D}=exit{X} │ {M}◆{X}{D}=DN hunter{X}")
 
     # Line 13: bottom separator
     buf.write(f"\033[13;1H\033[K {C}{B}{'═' * (w - 2)}{X}")

@@ -1,7 +1,7 @@
 # Agent Handoff — Polymarket Scalp Radar
 
 > Read this before touching any code. This is a complete context dump for the incoming agent.
-> Previous handoff covered v1.2.5. This document supersedes it entirely and covers v1.3.3.
+> Previous handoff covered v1.2.5. This document supersedes it entirely and covers v1.4.0.
 
 ---
 
@@ -11,7 +11,7 @@
 **Branch:** `myWay`
 **Language:** Python 3
 **Entry point:** `polymarket/radar_poly.py`
-**Current version:** `v1.3.3`
+**Current version:** `v1.4.0`
 
 A fully autonomous terminal-based scalping radar for Polymarket UP/DOWN binary markets. It:
 - Reads real-time BTC/ETH/SOL/XRP price from Binance via WebSocket (HTTP fallback)
@@ -19,6 +19,7 @@ A fully autonomous terminal-based scalping radar for Polymarket UP/DOWN binary m
 - Detects market regime (TREND_UP, TREND_DOWN, RANGE, CHOP) and phase (EARLY, MID, LATE, CLOSING)
 - Auto-executes trades on Polymarket via `py_clob_client` with no human intervention required
 - Monitors TP/SL in real time, closes positions, logs everything to CSV
+- **v1.4.0:** Runs a background **Delta-Neutral Hunter** thread that scans for UP+DOWN arb opportunities and executes dual-leg buys when `ask_UP + ask_DN < DN_THRESHOLD`, locking in market-neutral profit
 
 ---
 
@@ -30,15 +31,16 @@ polymarket/
 ├── src/
 │   ├── binance_api.py     # Binance HTTP + indicator computation (RSI, MACD, VWAP, BB, ADX)
 │   ├── ws_binance.py      # Binance WebSocket client with auto-reconnect
-│   ├── signal_engine.py   # 6-component scoring engine, phase/regime thresholds
-│   ├── trade_executor.py  # Buy/sell/close/monitor_tp_sl execution
-│   ├── polymarket_api.py  # Polymarket CLOB client wrappers
-│   ├── market_config.py   # Asset/window config (BTC/ETH/SOL/XRP, 5m/15m)
-│   ├── session_stats.py   # P&L stats calculation and summary display
-│   ├── ui_panel.py        # Terminal split-screen panel rendering
-│   ├── logger.py          # CSV logging (signals, trades, sessions)
-│   ├── colors.py          # ANSI color constants
-│   └── input_handler.py   # Non-blocking key reads, sleep_with_key
+│   ├── signal_engine.py         # 6-component scoring engine, phase/regime thresholds
+│   ├── trade_executor.py        # Buy/sell/close/monitor_tp_sl execution
+│   ├── polymarket_api.py        # Polymarket CLOB client wrappers
+│   ├── market_config.py         # Asset/window config (BTC/ETH/SOL/XRP, 5m/15m)
+│   ├── session_stats.py         # P&L stats calculation and summary display
+│   ├── ui_panel.py              # Terminal split-screen panel rendering
+│   ├── logger.py                # CSV logging (signals, trades, sessions)
+│   ├── colors.py                # ANSI color constants
+│   ├── input_handler.py         # Non-blocking key reads, sleep_with_key
+│   └── delta_neutral_hunter.py  # Background arb thread (v1.4.0)
 ├── logs/                  # Runtime CSV output (gitignored)
 │   ├── signals_YYYY-MM-DD.csv
 │   ├── trades_YYYY-MM-DD.csv
@@ -53,6 +55,7 @@ polymarket/
 ## Git Commit History (most recent first)
 
 ```
+(pending) v1.4.0 — Delta-Neutral Hunter: background arb thread, dual-leg buy, pause/resume hooks
 (pending) v1.3.3 — MR path entry guards: min floor $0.25, MAX_ENTRY_PRICE ceiling, SL/entry ratio
 540e090 v1.3.2 — MAX_ENTRY_PRICE ceiling guard ($0.85), block near-resolved token entries
 4ed092c v1.3.1 — RANGE hard block, counter-trend block, SL/entry ratio floor
@@ -69,7 +72,22 @@ a2b481f v1.2.1 — hotfix: UnboundLocalError crash + monitor polling wrong price
 
 ---
 
-## All Fixes Applied This Session (v1.3.0 → v1.3.3)
+## All Fixes Applied This Session (v1.3.0 → v1.4.0)
+
+### v1.4.0
+- **Delta-Neutral Hunter** (`src/delta_neutral_hunter.py`, `radar_poly.py`, `src/ui_panel.py`): New background daemon thread that scans for market-neutral arbitrage opportunities every `DN_SCAN_INTERVAL` seconds (default 1s). When `ask_UP + ask_DN < DN_THRESHOLD` (default 0.985), both legs are bought simultaneously via concurrent GTC limit orders, locking in ≥1.5% gross spread guaranteed by Polymarket's $1.00 resolution. Key design decisions:
+  - **Separate `ClobClient`**: hunter creates its own client instance at thread start — never shares the main loop's client (avoids concurrent mutation of stateful HTTP sessions).
+  - **Separate `ThreadPoolExecutor`**: 4 workers with `dn_hunter` prefix — does not starve the main loop's pool.
+  - **Double-confirmation**: prices re-fetched on trigger; worse (higher) of both quotes used for order prices — filters stale momentary dips.
+  - **No slippage offset**: orders placed at the exact observed ask (not ask + 0.02 like directional buys) — the spread IS the profit margin; adding offset would consume it.
+  - **Partial-fill mitigation**: if one leg fills and the other fails, the filled leg is immediately unwound via aggressive low-limit sell.
+  - **Pause/resume**: hunter pauses before every `monitor_tp_sl()` call (MR and signal paths) and resumes after — prevents interleaved terminal output during the TP/SL display loop.
+  - **Market-switch awareness**: `hunter.set_market()` called whenever the main loop detects a new slug.
+  - **Result queue**: arb outcomes pushed to `queue.Queue` and drained by main loop each cycle; printed to scrolling log and logged to `trades_YYYY-MM-DD.csv` with `reason="delta_neutral"`.
+  - **Daily cap**: `DN_MAX_DAILY=5` prevents runaway arb during volatile sessions; resets at midnight.
+  - **UI**: DN status (`◆ DN scanning $0.9923  0 arbs`) appended to line 10 of static panel on every redraw.
+  - All config via `.env` / `.env.example`: `DN_ENABLED`, `DN_THRESHOLD`, `DN_STAKE`, `DN_MAX_DAILY`, `DN_SCAN_INTERVAL`, `DN_ORDER_TIMEOUT`, `DN_MIN_SHARES`, `DN_FEE_ESTIMATE`.
+
 
 ### v1.3.3
 - **Mean Reversion path missing entry price guards** (`radar_poly.py`): The MR execution path lacked the three entry-price guards that the signal path has had since v1.3.1/v1.3.2. Added the same three guards to the MR `elif` chain immediately before `handle_buy()`:
@@ -181,6 +199,24 @@ Fires when: `current_phase == 'MID'` AND `(rsi <= 15 AND bb <= 0.10)` (UP) or `(
 
 TP = `entry + TP_BASE_SPREAD + 0.05`, SL = `entry - SL_DEFAULT`.
 
+### Delta-Neutral Hunter Path (v1.4.0)
+Runs on its own daemon thread (`dn_hunter`). Scans every `DN_SCAN_INTERVAL` seconds. Fires when `ask_UP + ask_DN < DN_THRESHOLD`.
+
+**Guards:** `DN_ENABLED`, `DN_MAX_DAILY` daily cap, token IDs set (`set_market()` called), not paused (pauses during `monitor_tp_sl()`), shares ≥ `DN_MIN_SHARES`.
+
+**No TP/SL monitoring required** — the position holds to market resolution. One leg always wins $1, the other expires at $0; net payout is always $1.00 per pair regardless of outcome. Profit is locked at the moment of fill.
+
+**Thread-safety model:**
+```
+Main thread                     Hunter thread
+────────────────────────────    ──────────────────────────────────
+hunter.pause()                  _pause_event.is_set() → sleep(0.2)
+  monitor_tp_sl() [blocking]
+hunter.resume()                 _pause_event.clear() → resumes scan
+hunter.result_queue.get()  ←── result_queue.put(ArbResult)
+radar_logger.log_trade()        (hunter logs via its own call too)
+```
+
 ### Autonomy
 The bot is **fully autonomous** when launched from an activated venv:
 - Trades fire automatically with no human input
@@ -213,6 +249,13 @@ The bot is **fully autonomous** when launched from an activated venv:
 | `COUNTER_TREND_BLOCK` | 1 | 1 | Hard block counter-trend signals |
 | `MIN_ENTRY_SL_RATIO` | 0.40 | 0.40 | Max SL/entry ratio (rejects low-price entries) |
 | `MAX_ENTRY_PRICE` | 0.85 | 0.85 | Upper entry ceiling (prevents compressed TP room) |
+| `DN_ENABLED` | 1 | 1 | Enable/disable Delta-Neutral Hunter |
+| `DN_THRESHOLD` | 0.985 | 0.985 | Max combined ask to trigger arb |
+| `DN_STAKE` | 4 | 4 | USD per leg (total outlay = 2×) |
+| `DN_MAX_DAILY` | 5 | 5 | Max arb trades per calendar day |
+| `DN_SCAN_INTERVAL` | 1.0 | 1.0 | Seconds between price scans |
+| `DN_ORDER_TIMEOUT` | 20 | 20 | Seconds before unfilled leg is cancelled |
+| `DN_FEE_ESTIMATE` | 0.01 | 0.01 | Per-leg fee estimate (display only) |
 | `MACD_FAST` | 12 | 5 | MACD fast period |
 | `MACD_SLOW` | 26 | 10 | MACD slow period |
 | `MACD_SIGNAL` | 9 | 4 | MACD signal period |
@@ -261,12 +304,16 @@ Signal path is net negative. MR path is much better but two large-stake losses (
 ### ✅ Priority 1 — MR Path Entry Guards — DONE (v1.3.3)
 Fixed in this session. Three guards added to MR `elif` chain before `handle_buy()`: min floor `$0.25`, max ceiling `MAX_ENTRY_PRICE ($0.85)`, SL/entry ratio `MIN_ENTRY_SL_RATIO (0.40)`. All five historical worst-case MR trades are now blocked. See fixed section above.
 
-### 🔴 Priority 2 — Restart Bot to Activate All v1.3.x Fixes
-Four fixes are committed but not yet running (bot has not been restarted since before v1.3.0):
+### ✅ Delta-Neutral Hunter — DONE (v1.4.0)
+New feature implemented in this session. See architecture section above and CHANGELOG for full detail.
+
+### 🔴 Priority 2 — Restart Bot to Activate All v1.3.x + v1.4.0 Changes
+Five changes are committed but not yet running (bot has not been restarted since before v1.3.0):
 - `MAX_CANDLES=60` → MACD finally live (v1.3.0)
 - RANGE block, counter-trend block, SL ratio floor (v1.3.1)
 - `MAX_ENTRY_PRICE=0.85` ceiling (v1.3.2)
-- MR entry guards (v1.3.3) ← new
+- MR entry guards (v1.3.3)
+- Delta-Neutral Hunter thread (v1.4.0) ← new
 
 ### 🟡 Priority 3 — MACD Thresholds Need Calibration
 Now that MACD will be live for the first time (`W_MACD=0.10`, MACD 12/26/9 on 1-min BTC candles), the scoring thresholds in `signal_engine.py` were designed for normalised values but receive raw BTC dollar units. The MACD histogram for BTC can be ±$50. The thresholds `abs(macd_hist_delta) > 0.5` (strong) and `> 0.1` (moderate) are far too small — they will always fire at maximum score. Consider normalising: `macd_hist / atr` or `macd_hist / btc_price * 1000`. Check the first live session's signal logs to confirm MACD is non-zero and assess whether it's contributing sensibly.
@@ -303,15 +350,31 @@ Logs are written to `logs/` automatically. Check `logs/sessions.csv` for session
 ### Step 1 — ✅ MR entry guards — DONE (v1.3.3)
 Already implemented. Three guards (`$0.25` floor, `MAX_ENTRY_PRICE` ceiling, `SL/entry` ratio) added to the MR `elif` chain in `radar_poly.py` ~L713–L721. No further action needed here.
 
-### Step 2 — Restart the bot
-Commit v1.3.3, push, then restart the bot. This activates `MAX_CANDLES=60` (MACD), all v1.3.1 regime guards, v1.3.2 entry ceiling, and v1.3.3 MR guards simultaneously for the first time.
+### Step 1b — ✅ Delta-Neutral Hunter — DONE (v1.4.0)
+Already implemented. `src/delta_neutral_hunter.py` is the full implementation. Wired into `radar_poly.py` (import, init after WS startup, `set_market()` on slug change, `pause()`/`resume()` around both `monitor_tp_sl()` calls, result queue drain each cycle, `hunter.stop()` in `finally`). Hunter status shown on panel line 10. All config in `.env.example`.
 
-### Step 3 — Run a session and check MACD
+### Step 2 — Restart the bot
+Commit v1.4.0, push, then restart the bot. This activates `MAX_CANDLES=60` (MACD), all v1.3.x guards, MR entry guards, and the DN Hunter simultaneously for the first time.
+
+### Step 3 — Run a session and check MACD + DN Hunter
 After restart, check the first few signal rows in `logs/signals_YYYY-MM-DD.csv`:
 - `macd_hist` column should be non-zero (e.g. `±5` to `±50` for BTC)
 - If still zero: verify `MAX_CANDLES` in `src/ws_binance.py` is 60, and that `MACD_SLOW + MACD_SIGNAL = 35` is less than 60
 
-### Step 4 — Log analysis pattern
+For the DN Hunter:
+- Watch the scrolling log for `◆ DN scanning $X.XXXX` — this confirms the thread is live and prices are being fetched
+- Combined price for BTC 15m UP+DOWN tokens is typically `$0.990–$0.999` (very tight); genuine arb below `$0.985` may be rare — this is expected
+- If you want to observe the hunter fire in testing, temporarily lower `DN_THRESHOLD=0.995` in `.env` and restart (remember to revert after)
+- Check `logs/trades_YYYY-MM-DD.csv` for rows with `reason=delta_neutral` after any arb fills
+- If the hunter thread crashes silently, the status line will show `◆ DN stopped` — check logs for the error
+
+### Step 4 — DN Hunter calibration (after first session)
+The default `DN_THRESHOLD=0.985` is conservative. After observing a full session:
+- If `last_combined` (shown on panel) is consistently `$0.992–$0.999`, consider raising threshold to `0.992` for more opportunities
+- If fills are occurring but one leg frequently times out (PARTIAL results), reduce `DN_ORDER_TIMEOUT` from 20s to 10s — stale arb quotes disappear fast
+- If `DN_STAKE=$4` per leg feels too large given uncertainty on first live run, set `DN_STAKE=2` to halve exposure while validating the path
+
+### Step 5 — Log analysis pattern
 ```bash
 cat logs/sessions.csv
 cat logs/trades_YYYY-MM-DD.csv
@@ -325,7 +388,7 @@ Key things to check per session:
 - **SL timing** — exits within 15s = spread noise, exits at 60–120s = genuine move against
 - **MR stake size** — should now be capped by entry guards (confirm no $5 stake at $0.10 entry)
 
-### Step 5 — After any code change
+### Step 6 — After any code change
 ```bash
 # always in this order:
 # 1. run diagnostics (no errors)

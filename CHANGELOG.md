@@ -6,6 +6,47 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.4.0] — 2025
+
+### Added — Delta-Neutral Hunter (`src/delta_neutral_hunter.py`, `radar_poly.py`, `src/ui_panel.py`)
+
+A fully autonomous background arbitrage thread that runs alongside the main directional strategy. Every `DN_SCAN_INTERVAL` seconds (default 1s) it fetches the Best Ask for both UP and DOWN tokens concurrently and checks if `ask_UP + ask_DN < DN_THRESHOLD` (default 0.985).
+
+**Payout mechanics:** Polymarket binary markets resolve to exactly $1.00 per share pair — one leg wins $1, the other expires worthless, net = $1.00. A pair purchased at combined cost $0.982 locks in $0.018 gross profit per pair (~1.8%) regardless of where BTC goes. After the estimated ~1% combined taker fee, net target is ≥0.5% per pair.
+
+**Architecture — `DeltaNeutralHunter` class:**
+- Owns a **separate `ClobClient` instance** (created at thread start via `create_client_fn`) — never shares the main loop's client to avoid concurrent mutation of stateful HTTP sessions.
+- Owns a **separate `ThreadPoolExecutor`** (4 workers, `dn_hunter` prefix) — does not starve the main loop's 4-worker pool.
+- Thread-safe coordination with main loop via primitives only: `threading.Event` stop/pause, `threading.Lock` for terminal output, `queue.Queue` for result delivery.
+- **Double-confirmation on trigger:** prices are re-fetched immediately when the threshold is crossed; the worse (higher) of both quotes is used for execution. Stale/momentary dips are filtered.
+- **Simultaneous dual-leg submission:** both GTC limit buy orders are submitted concurrently at the observed ask price (no `BUY_PRICE_OFFSET` slippage padding — the arb spread IS the profit margin).
+- **Partial-fill mitigation:** if one leg fills and the other fails/times out, the filled leg is unwound immediately via an aggressive low-limit sell order, minimising directional exposure.
+- **Pause/resume hooks:** hunter is paused before each `monitor_tp_sl()` call (MR and signal paths) and resumed after, preventing concurrent terminal writes during the TP/SL display loop.
+- **Market-switch awareness:** `hunter.set_market()` is called whenever the main loop detects a new market slug, so the hunter always scans the correct token pair.
+
+**Configuration (all via `.env`, see `.env.example`):**
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `DN_ENABLED` | 1 | Enable/disable hunter entirely |
+| `DN_THRESHOLD` | 0.985 | Max combined ask to trigger arb |
+| `DN_STAKE` | 4 | USD per leg (total outlay = 2×) |
+| `DN_MAX_DAILY` | 5 | Max arb trades per calendar day |
+| `DN_SCAN_INTERVAL` | 1.0 | Seconds between price scans |
+| `DN_ORDER_TIMEOUT` | 20 | Seconds before unfilled leg is cancelled |
+| `DN_MIN_SHARES` | 5 | Minimum shares per leg |
+| `DN_FEE_ESTIMATE` | 0.01 | Per-leg fee for net-profit display only |
+
+**UI integration:**
+- DN hunter status (`◆ DN scanning $0.9923 0 arbs`) appended to line 10 (alert/scenario line) of the static panel on every redraw.
+- `◆ DN hunter` legend added to line 12 (hotkeys line).
+- Each cycle the main loop drains `hunter.result_queue` and prints FILLED/PARTIAL/FAILED outcomes to the scrolling log area with combined price, spread %, and estimated net profit.
+- All arb legs logged to `trades_YYYY-MM-DD.csv` with `reason="delta_neutral"` for post-session analysis.
+
+**Shutdown:** `hunter.stop()` called in the `finally` block alongside `binance_ws.stop()` and `_executor.shutdown()`.
+
+---
+
 ## [1.3.3] — 2025
 
 ### Fixed — Critical
