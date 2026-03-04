@@ -482,7 +482,7 @@ def get_full_analysis(candles: list[dict] | None = None, symbol: str = "BTCUSDT"
         direction, confidence, details
     """
     if candles is None:
-        candles = get_klines(symbol=symbol, interval="1m", limit=20)
+        candles = get_klines(symbol=symbol, interval="1m", limit=60)
     direction, confidence, details = analyze_trend(candles)
 
     details['rsi'] = compute_rsi(candles)

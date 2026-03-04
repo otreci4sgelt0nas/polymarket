@@ -106,7 +106,7 @@ class BinanceWS:
             except Exception as e:
                 logger.debug("WS close error: %s", e)
 
-    def get_candles(self, limit: int = 20) -> tuple[list[dict], str]:
+    def get_candles(self, limit: int = 60) -> tuple[list[dict], str]:
         """Get candles from WS buffer. Falls back to HTTP if WS has no data.
 
         Returns:

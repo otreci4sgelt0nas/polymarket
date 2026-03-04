@@ -154,16 +154,22 @@ def compute_signal(up_buy, down_buy, btc_price, binance, history, regime='RANGE'
     # 4. MACD HISTOGRAM DELTA (15%) — momentum acceleration
     macd_hist = binance.get('macd_hist', 0)
     macd_hist_delta = binance.get('macd_hist_delta', 0)
+
+    # Normalize by BTC price to match thresholds designed for ~$1.00 assets
+    # (e.g. if BTC=70k, a $50 delta becomes 50 / 70000 * 1000 = 0.71)
+    norm_delta = (macd_hist_delta / btc_price * 1000) if btc_price > 0 else 0
+    norm_hist = (macd_hist / btc_price * 1000) if btc_price > 0 else 0
+
     macd_score = 0.0
-    if abs(macd_hist_delta) > 0.5:
+    if abs(norm_delta) > 0.5:
         # Strong acceleration
-        macd_score = 1.0 if macd_hist_delta > 0 else -1.0
-    elif abs(macd_hist_delta) > 0.1:
-        macd_score = 0.5 if macd_hist_delta > 0 else -0.5
+        macd_score = 1.0 if norm_delta > 0 else -1.0
+    elif abs(norm_delta) > 0.1:
+        macd_score = 0.5 if norm_delta > 0 else -0.5
     # Boost if histogram and delta agree
-    if macd_hist > 0 and macd_hist_delta > 0:
+    if norm_hist > 0 and norm_delta > 0:
         macd_score = min(macd_score * 1.2, 1.0)
-    elif macd_hist < 0 and macd_hist_delta < 0:
+    elif norm_hist < 0 and norm_delta < 0:
         macd_score = max(macd_score * 1.2, -1.0)
     score += macd_score * W_MACD
 

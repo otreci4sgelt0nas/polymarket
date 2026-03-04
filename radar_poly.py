@@ -568,7 +568,7 @@ def main():
 
                 # Collect data (WS candles if available, else HTTP)
                 try:
-                    ws_candles, data_source = binance_ws.get_candles(limit=20)
+                    ws_candles, data_source = binance_ws.get_candles(limit=60)
                     if ws_candles and len(ws_candles) >= 5:
                         bin_direction, confidence, details = get_full_analysis(candles=ws_candles, symbol=config.binance_symbol)
                     else:
