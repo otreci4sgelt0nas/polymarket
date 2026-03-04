@@ -119,7 +119,8 @@ class DeltaNeutralHunter:
 
     def __init__(self, create_client_fn, get_price_fn, radar_logger,
                  print_lock: threading.Lock | None = None,
-                 stake_amount: float = DN_STAKE):
+                 stake_amount: float = DN_STAKE,
+                 get_balance_fn=None):
         """
         Args:
             create_client_fn: callable() -> (ClobClient, limit) — same as
@@ -131,9 +132,11 @@ class DeltaNeutralHunter:
             print_lock:       optional threading.Lock for serialised terminal
                               output.  A new lock is created if None.
             stake_amount:     USD per leg (defaults to DN_STAKE)
+            get_balance_fn:   callable(client) -> float — returns available balance.
         """
         self._create_client = create_client_fn
         self._get_price     = get_price_fn
+        self._get_balance   = get_balance_fn
         self._logger        = radar_logger
         self._print_lock    = print_lock or threading.Lock()
         self.stake_amount   = stake_amount
@@ -341,8 +344,17 @@ class DeltaNeutralHunter:
 
             # ── Execute both legs ─────────────────────────────────────────
             self.status = "firing"
+
+            # Fetch balance if available, otherwise assume enough (to not break old behavior)
+            current_balance = float('inf')
+            if self._get_balance and self._client:
+                try:
+                    current_balance = self._get_balance(self._client)
+                except Exception as e:
+                    logger.debug("[DN Hunter] balance fetch error: %s", e)
+
             result = self._execute_arb(token_up, token_dn, ask_up_use, ask_dn_use,
-                                       worst_combined, spread, now_str)
+                                       worst_combined, spread, now_str, current_balance)
             self.result_queue.put(result)
 
             if result.status == "FILLED":
@@ -451,6 +463,7 @@ class DeltaNeutralHunter:
         combined: float,
         spread: float,
         now_str: str,
+        current_balance: float = float('inf'),
     ) -> ArbResult:
         """
         Submit both legs simultaneously, poll for fills, cancel if either fails.
@@ -476,6 +489,21 @@ class DeltaNeutralHunter:
 
         shares_up = round(self.stake_amount / price_up, 2)
         shares_dn = round(self.stake_amount / price_dn, 2)
+
+        total_cost = (shares_up * price_up) + (shares_dn * price_dn)
+        if current_balance < total_cost:
+            return ArbResult(
+                timestamp=now_str, ask_up=ask_up, ask_dn=ask_dn,
+                combined=combined, spread=spread,
+                shares_up=shares_up, shares_dn=shares_dn,
+                fill_price_up=0.0, fill_price_dn=0.0,
+                status="FAILED", net_profit=0.0,
+                note=(
+                    f"Insufficient balance: need ${total_cost:.2f} "
+                    f"(UP=${shares_up*price_up:.2f}, DN=${shares_dn*price_dn:.2f}), "
+                    f"have ${current_balance:.2f}."
+                ),
+            )
 
         if shares_up < MIN_SHARES or shares_dn < MIN_SHARES:
             return ArbResult(

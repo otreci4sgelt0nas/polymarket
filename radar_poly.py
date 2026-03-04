@@ -455,6 +455,7 @@ def main():
         radar_logger=radar_logger,
         print_lock=_print_lock,
         stake_amount=trade_amount,
+        get_balance_fn=get_balance,
     )
     hunter.set_market(session.token_up, session.token_down)
     if DN_ENABLED:
