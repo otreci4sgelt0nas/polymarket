@@ -33,7 +33,7 @@ CLOSE_MONITOR_TIMEOUT = 15    # seconds to wait for close order fill
 TP_SL_MONITOR_TIMEOUT = 600   # seconds before TP/SL monitoring times out
 
 
-def sync_positions(client, token_up, token_down, positions, get_price):
+def sync_positions(client, token_up, token_down, positions, get_price, dn_shares_up=0.0, dn_shares_down=0.0):
     """Sync local positions with actual on-chain balances.
 
     Detects shares bought/sold directly on Polymarket's web interface
@@ -44,6 +44,8 @@ def sync_positions(client, token_up, token_down, positions, get_price):
         token_up/token_down: token IDs for current market
         positions: list of local position dicts (mutated in place)
         get_price: callable(token_id, side) -> float
+        dn_shares_up: amount of UP shares held for delta-neutral strategy
+        dn_shares_down: amount of DOWN shares held for delta-neutral strategy
 
     Returns:
         list of (direction, shares, price, action) tuples describing changes.
@@ -57,6 +59,12 @@ def sync_positions(client, token_up, token_down, positions, get_price):
         except Exception as e:
             logger.debug("sync_positions: error querying %s: %s", direction, e)
             continue
+
+        # Subtract DN shares so they aren't falsely adopted as directional orphans
+        if direction == 'up':
+            actual_shares = max(0.0, actual_shares - dn_shares_up)
+        else:
+            actual_shares = max(0.0, actual_shares - dn_shares_down)
 
         # Sum shares tracked locally for this direction
         local_shares = sum(p['shares'] for p in positions if p['direction'] == direction)

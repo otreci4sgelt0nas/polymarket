@@ -222,6 +222,8 @@ class TradingSession:
 
         # Trading state
         self.positions = []
+        self.dn_shares_up = 0.0
+        self.dn_shares_down = 0.0
         self.balance = 0.0
         self.session_pnl = 0.0
         self.trade_count = 0
@@ -369,7 +371,9 @@ def main():
     # Sync existing positions (bought directly on Polymarket platform)
     print(f"   Checking existing positions...", end="", flush=True)
     changes = sync_positions(client, session.token_up, session.token_down,
-                             session.positions, get_price)
+                             session.positions, get_price,
+                             dn_shares_up=session.dn_shares_up,
+                             dn_shares_down=session.dn_shares_down)
     if changes:
         total_orphan_usd = sum(shares * price for _, shares, price, action in changes if action == 'added')
         print(f" {Y}{B}⚠ WARNING: {len(changes)} ORPHAN POSITION(S) DETECTED (${total_orphan_usd:.2f} at risk){X}")
@@ -537,6 +541,8 @@ def main():
                                     print(f"   {Y}  expired {d.upper()} {sh:.0f}sh @ ${ep:.2f} → ${xp:.2f} {pnl_color}P&L: {'+' if pnl >= 0 else ''}${pnl:.2f}{X}")
                             session.history.clear()
                             reset_vwap_anchor()  # Fix #8: reset session VWAP on new market window
+                            session.dn_shares_up = 0.0
+                            session.dn_shares_down = 0.0
                             # Fetch new Price to Beat
                             try:
                                 window_ts = int(new_slug.split('-')[-1])
@@ -558,7 +564,9 @@ def main():
                         try:
                             changes = sync_positions(
                                 client, session.token_up, session.token_down,
-                                session.positions, get_price)
+                                session.positions, get_price,
+                                dn_shares_up=session.dn_shares_up,
+                                dn_shares_down=session.dn_shares_down)
                             if changes:
                                 for direction, shares, price, action in changes:
                                     d_color = G if direction == 'up' else R
@@ -729,6 +737,21 @@ def main():
                     try:
                         arb = hunter.result_queue.get_nowait()
                         if arb.status == "FILLED":
+                            session.dn_shares_up += arb.shares_up
+                            session.dn_shares_down += arb.shares_dn
+
+                            # Log to session stats
+                            session.session_pnl += arb.net_profit
+                            session.trade_count += 1
+                            session.trade_history.append(arb.net_profit)
+
+                            # Log a mock "CLOSE" row to the CSV so external tools see the resolved profit
+                            radar_logger.log_trade(
+                                "CLOSE", "delta_neutral",
+                                1.0, 1.0, 1.0, "delta_neutral_arb",
+                                arb.net_profit, session.session_pnl
+                            )
+
                             _arb_pnl_color = G if arb.net_profit >= 0 else R
                             print(
                                 f"   {M}{B}[DN ARB FILLED]{X} "
