@@ -487,8 +487,16 @@ class DeltaNeutralHunter:
         price_up = min(round(ask_up, 4), MAX_PRICE)
         price_dn = min(round(ask_dn, 4), MAX_PRICE)
 
-        shares_up = round(self.stake_amount / price_up, 2)
-        shares_dn = round(self.stake_amount / price_dn, 2)
+        # For a true Delta-Neutral arb on Polymarket, you MUST buy the exact same
+        # number of shares on both sides. Otherwise, you take directional risk.
+        # We target a total spend of approximately 2 * stake_amount.
+        target_total_spend = 2.0 * self.stake_amount
+        combined_price = price_up + price_dn
+
+        target_shares = round(target_total_spend / combined_price, 2)
+
+        shares_up = target_shares
+        shares_dn = target_shares
 
         total_cost = (shares_up * price_up) + (shares_dn * price_dn)
         if current_balance < total_cost:
