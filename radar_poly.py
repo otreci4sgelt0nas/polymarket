@@ -431,12 +431,13 @@ def main():
         get_price_fn=get_price,
         radar_logger=radar_logger,
         print_lock=_print_lock,
+        stake_amount=trade_amount,
     )
     hunter.set_market(session.token_up, session.token_down)
     if DN_ENABLED:
         hunter_started = hunter.start()
         if hunter_started:
-            print(f"   {M}◆ Delta-Neutral Hunter started{X} — threshold=${float(os.getenv('DN_THRESHOLD', '0.985')):.4f} stake=${float(os.getenv('DN_STAKE', '4')):.0f}/leg")
+            print(f"   {M}◆ Delta-Neutral Hunter started{X} — threshold=${float(os.getenv('DN_THRESHOLD', '0.985')):.4f} stake=${trade_amount:.0f}/leg")
         else:
             print(f"   {D}◆ Delta-Neutral Hunter failed to start{X}")
     else:

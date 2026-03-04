@@ -29,7 +29,7 @@ Thread safety:
 Configuration (.env):
   DN_ENABLED        1       Enable/disable hunter entirely
   DN_THRESHOLD      0.985   Max combined ask price to trigger arb
-  DN_STAKE          4       USD per LEG (total outlay = 2 × DN_STAKE)
+  DN_STAKE          4       USD per LEG (defaults to TRADE_AMOUNT)
   DN_MAX_DAILY      5       Max arb trades per calendar day (0 = unlimited)
   DN_SCAN_INTERVAL  1.0     Seconds between price scans
   DN_ORDER_TIMEOUT  20      Seconds before an unfilled leg order is cancelled
@@ -63,7 +63,8 @@ logger = logging.getLogger(__name__)
 
 DN_ENABLED       = os.getenv("DN_ENABLED", "1").lower() in ("1", "true", "yes")
 DN_THRESHOLD     = float(os.getenv("DN_THRESHOLD", "0.985"))
-DN_STAKE         = float(os.getenv("DN_STAKE", "4"))
+_dn_stake_env = os.getenv("DN_STAKE", "")
+DN_STAKE         = float(_dn_stake_env) if _dn_stake_env else float(os.getenv("TRADE_AMOUNT", "4"))
 DN_MAX_DAILY     = int(os.getenv("DN_MAX_DAILY", "5"))
 DN_SCAN_INTERVAL = float(os.getenv("DN_SCAN_INTERVAL", "1.0"))
 DN_ORDER_TIMEOUT = int(os.getenv("DN_ORDER_TIMEOUT", "20"))
@@ -117,7 +118,8 @@ class DeltaNeutralHunter:
     """
 
     def __init__(self, create_client_fn, get_price_fn, radar_logger,
-                 print_lock: threading.Lock | None = None):
+                 print_lock: threading.Lock | None = None,
+                 stake_amount: float = DN_STAKE):
         """
         Args:
             create_client_fn: callable() -> (ClobClient, limit) — same as
@@ -128,11 +130,13 @@ class DeltaNeutralHunter:
             radar_logger:     RadarLogger instance for CSV logging.
             print_lock:       optional threading.Lock for serialised terminal
                               output.  A new lock is created if None.
+            stake_amount:     USD per leg (defaults to DN_STAKE)
         """
         self._create_client = create_client_fn
         self._get_price     = get_price_fn
         self._logger        = radar_logger
         self._print_lock    = print_lock or threading.Lock()
+        self.stake_amount   = stake_amount
 
         # Shared market state — written by main loop, read by hunter thread
         self._token_up:   str = ""
@@ -230,7 +234,7 @@ class DeltaNeutralHunter:
         """Main hunter loop — runs on the daemon thread."""
         self._print(
             f"   {M}{B}[DN Hunter]{X} {G}Started{X} — threshold={DN_THRESHOLD:.4f} "
-            f"stake=${DN_STAKE:.0f}/leg interval={DN_SCAN_INTERVAL:.1f}s"
+            f"stake=${self.stake_amount:.0f}/leg interval={DN_SCAN_INTERVAL:.1f}s"
         )
 
         # Create own CLOB client
@@ -470,8 +474,8 @@ class DeltaNeutralHunter:
         price_up = min(round(ask_up, 4), MAX_PRICE)
         price_dn = min(round(ask_dn, 4), MAX_PRICE)
 
-        shares_up = round(DN_STAKE / price_up, 2)
-        shares_dn = round(DN_STAKE / price_dn, 2)
+        shares_up = round(self.stake_amount / price_up, 2)
+        shares_dn = round(self.stake_amount / price_dn, 2)
 
         if shares_up < MIN_SHARES or shares_dn < MIN_SHARES:
             return ArbResult(
@@ -482,7 +486,7 @@ class DeltaNeutralHunter:
                 status="FAILED", net_profit=0.0,
                 note=(
                     f"Shares below minimum: UP={shares_up:.2f} DN={shares_dn:.2f} "
-                    f"(min={MIN_SHARES}). Increase DN_STAKE."
+                    f"(min={MIN_SHARES}). Increase DN_STAKE / TRADE_AMOUNT."
                 ),
             )
 
