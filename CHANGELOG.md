@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [1.3.3] — 2025
+
+### Fixed — Critical
+
+- **Mean Reversion path missing entry price guards** (`radar_poly.py`)
+  The MR execution path lacked the three entry-price guards that the signal path has had since v1.3.1/v1.3.2. This allowed MR trades to fire at dangerously low entry prices (e.g. `$0.10–$0.15`) with full `TRADE_AMOUNT` stake, producing disproportionately large losses: at `entry=$0.10` with `TRADE_AMOUNT=$5`, 50 shares are purchased and a SL at `$0.03` costs `$3.50` — the worst two MR losses in history (`-$3.97` at `$0.15` entry, `-$3.50` at `$0.10` entry) were both caused by this gap. Added the same three guards to the MR `elif` chain immediately before `handle_buy()`:
+  1. **Min floor**: `mr_token_price < 0.25` → skip (same `$0.25` floor as signal path)
+  2. **Max ceiling**: `mr_token_price > MAX_ENTRY_PRICE ($0.85)` → skip with TP-room diagnostic
+  3. **SL/entry ratio**: `SL_DEFAULT / mr_token_price > MIN_ENTRY_SL_RATIO (0.40)` → skip with ratio diagnostic
+  All three guards respect the same `.env` knobs (`MAX_ENTRY_PRICE`, `MIN_ENTRY_SL_RATIO`) as the signal path. Skip messages are printed in yellow using the same format as signal-path skips for log consistency.
+
+---
+
 ## [1.3.2] — 2025
 
 ### Fixed — Critical

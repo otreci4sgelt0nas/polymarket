@@ -711,6 +711,14 @@ def main():
                                 print(f"   {D}  MR skipped — trade cooldown ({cd_left}s left){X}")
                             elif session.balance < trade_amount:
                                 print(f"   {Y}  MR skipped — insufficient balance (${session.balance:.2f} < ${trade_amount:.0f}){X}")
+                            elif mr_token_price < 0.25:
+                                print(f"   {Y}  MR skipped — entry ${mr_token_price:.2f} below min $0.25 (too risky){X}")
+                            elif MAX_ENTRY_PRICE > 0 and mr_token_price > MAX_ENTRY_PRICE:
+                                _mr_tp_room = TP_MAX_PRICE - mr_token_price
+                                print(f"   {Y}  MR skipped — entry ${mr_token_price:.2f} above max ${MAX_ENTRY_PRICE:.2f} (TP room ${_mr_tp_room:.2f} too compressed){X}")
+                            elif MIN_ENTRY_SL_RATIO > 0 and (SL_DEFAULT / mr_token_price) > MIN_ENTRY_SL_RATIO:
+                                _mr_sl_ratio = SL_DEFAULT / mr_token_price
+                                print(f"   {Y}  MR skipped — SL/entry ratio {_mr_sl_ratio:.0%} > {MIN_ENTRY_SL_RATIO:.0%} max (entry ${mr_token_price:.2f} too low for ${SL_DEFAULT:.2f} SL){X}")
                             else:
                                 # All guards pass — fire immediately, same path as signal trades
                                 print(f"   {mr_color}{B}  AUTO-FIRING MR {mr_sym} {mr_direction}...{X}")

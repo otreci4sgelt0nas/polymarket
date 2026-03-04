@@ -1,7 +1,7 @@
 # Agent Handoff — Polymarket Scalp Radar
 
 > Read this before touching any code. This is a complete context dump for the incoming agent.
-> Previous handoff covered v1.2.5. This document supersedes it entirely and covers v1.3.2.
+> Previous handoff covered v1.2.5. This document supersedes it entirely and covers v1.3.3.
 
 ---
 
@@ -11,7 +11,7 @@
 **Branch:** `myWay`
 **Language:** Python 3
 **Entry point:** `polymarket/radar_poly.py`
-**Current version:** `v1.3.2`
+**Current version:** `v1.3.3`
 
 A fully autonomous terminal-based scalping radar for Polymarket UP/DOWN binary markets. It:
 - Reads real-time BTC/ETH/SOL/XRP price from Binance via WebSocket (HTTP fallback)
@@ -53,6 +53,7 @@ polymarket/
 ## Git Commit History (most recent first)
 
 ```
+(pending) v1.3.3 — MR path entry guards: min floor $0.25, MAX_ENTRY_PRICE ceiling, SL/entry ratio
 540e090 v1.3.2 — MAX_ENTRY_PRICE ceiling guard ($0.85), block near-resolved token entries
 4ed092c v1.3.1 — RANGE hard block, counter-trend block, SL/entry ratio floor
 7865322 v1.3.0 — fix MACD buffer (MAX_CANDLES 30→60), hard CHOP block, max session loss limit
@@ -68,7 +69,14 @@ a2b481f v1.2.1 — hotfix: UnboundLocalError crash + monitor polling wrong price
 
 ---
 
-## All Fixes Applied This Session (v1.3.0 → v1.3.2)
+## All Fixes Applied This Session (v1.3.0 → v1.3.3)
+
+### v1.3.3
+- **Mean Reversion path missing entry price guards** (`radar_poly.py`): The MR execution path lacked the three entry-price guards that the signal path has had since v1.3.1/v1.3.2. Added the same three guards to the MR `elif` chain immediately before `handle_buy()`:
+  1. `mr_token_price < 0.25` → skip (min floor)
+  2. `mr_token_price > MAX_ENTRY_PRICE` → skip (upper ceiling, TP room diagnostic printed)
+  3. `SL_DEFAULT / mr_token_price > MIN_ENTRY_SL_RATIO` → skip (SL-ratio floor, ratio printed)
+  All three respect the same `.env` knobs as the signal path. This prevents the worst class of MR losses: at `entry=$0.10` with `TRADE_AMOUNT=$5`, a SL at `$0.03` loses `$3.50`. The two largest MR losses in history (`-$3.97` at `$0.15`, `-$3.50` at `$0.10`) are now blocked.
 
 ### v1.3.2
 - **Near-resolved token entries passing all guards** (`radar_poly.py`): 44% of qualifying signals in the 88-min zero-trade session had `entry > $0.75` — near-settled markets. At `entry=$0.90`, TP is capped at `TP_MAX_PRICE=0.95`, leaving only $0.05 reward vs $0.14 SL (R:R=0.35:1). At `entry=$0.96`, `sug_tp - sug_entry` goes *negative*, producing an inverted `tp_above=False` flag on a long trade — a silent monitor error. Added `MAX_ENTRY_PRICE=0.85` (= `TP_MAX_PRICE − TP_BASE_SPREAD`). Guarantees at least $0.10 TP room on every entry. Configurable via `.env`.
@@ -94,25 +102,25 @@ a2b481f v1.2.1 — hotfix: UnboundLocalError crash + monitor polling wrong price
 
 ---
 
-## ⚠️ CRITICAL: Mean Reversion Path Missing Entry Guards
+## ✅ FIXED (v1.3.3): Mean Reversion Path Entry Guards
 
-The signal execution path has a full guard stack (see below). The Mean Reversion path does **not**. It only checks: `SIGNAL_ENABLED`, `phase == 'MID'`, `session.positions`, `loss_cooldown`, `trade_cooldown`, `balance`, and `token_price < 0.70`.
+The signal execution path has a full guard stack (see below). The Mean Reversion path previously did **not**. As of v1.3.3 the MR path now has the same three entry-price guards inserted before `handle_buy()` in the `elif` chain (`radar_poly.py` ~L713–L721):
 
-**Missing from MR path:** `$0.25` floor, `MAX_ENTRY_PRICE`, `MIN_ENTRY_SL_RATIO`, `MAX_SESSION_LOSS`, CHOP/RANGE/counter-trend regime blocks.
+1. `mr_token_price < 0.25` → skip (min floor)
+2. `mr_token_price > MAX_ENTRY_PRICE ($0.85)` → skip (upper ceiling)
+3. `SL_DEFAULT / mr_token_price > MIN_ENTRY_SL_RATIO (0.40)` → skip (SL-ratio floor)
 
-This caused the worst losses in the most recent sessions:
+These would have blocked all five of the worst MR losses:
 
-| Timestamp | Entry | Stake | Shares | SL hit | P&L |
-|---|---|---|---|---|---|
-| 2026-03-03 23:53 | $0.15 | $4.97 | 33 | $0.03 | **-$3.97** |
-| 2026-03-04 00:20 | $0.10 | $5.00 | 50 | $0.03 | **-$3.50** |
-| 2026-03-04 01:35 | $0.10 | $1.00 | 10 | $0.03 | -$0.70 |
-| 2026-03-04 02:50 | $0.12 | $0.99 | 8 | $0.03 | -$0.74 |
-| 2026-03-04 03:36 | $0.05 | $1.00 | 20 | $0.03 | -$0.40 |
+| Timestamp | Entry | Stake | Shares | SL hit | P&L | Guard that blocks |
+|---|---|---|---|---|---|---|
+| 2026-03-03 23:53 | $0.15 | $4.97 | 33 | $0.03 | **-$3.97** | SL/entry ratio 93% > 40% |
+| 2026-03-04 00:20 | $0.10 | $5.00 | 50 | $0.03 | **-$3.50** | min floor < $0.25 |
+| 2026-03-04 01:35 | $0.10 | $1.00 | 10 | $0.03 | -$0.70 | min floor < $0.25 |
+| 2026-03-04 02:50 | $0.12 | $0.99 | 8 | $0.03 | -$0.74 | min floor < $0.25 |
+| 2026-03-04 03:36 | $0.05 | $1.00 | 20 | $0.03 | -$0.40 | min floor < $0.25 |
 
-At entry=$0.10 with TRADE_AMOUNT=$5: 50 shares purchased. SL floor is $0.03 → loss = $3.50 on one trade. **The MR path needs the same entry price guards applied to it. This is the #1 priority fix.**
-
-The fix location is in `radar_poly.py` in the MR execution block (around the `# All guards pass — fire immediately` comment). Apply the same `entry_price < 0.25`, `entry_price > MAX_ENTRY_PRICE`, and `SL_DEFAULT / entry_price > MIN_ENTRY_SL_RATIO` checks before the `handle_buy()` call.
+**Still missing from MR path:** CHOP/RANGE/counter-trend regime blocks (lower priority — MR only fires in MID phase which has stronger regime signal, and the existing RSI/BB extremes are already a regime-agnostic filter). Monitor MR performance before adding regime blocks.
 
 ---
 
@@ -160,7 +168,7 @@ Stale data check (rsi=0 or bb=0.0) → skip cycle
 → entry_price < $0.25 → skip
 → entry_price > MAX_ENTRY_PRICE ($0.85) → skip
 → SL_DEFAULT / entry_price > MIN_ENTRY_SL_RATIO (0.40) → skip
-→ handle_buy() fires immediately
+→ handle_buy() fires immediately  [MR path now has all three guards above too — v1.3.3]
 → monitor_tp_sl() polls SELL price every 0.5s
 → TP/SL/CANCEL/EXPIRED/TIMEOUT → execute_close_market()
 → P&L logged, cooldowns stamped
@@ -169,7 +177,7 @@ Stale data check (rsi=0 or bb=0.0) → skip cycle
 ### Mean Reversion Path (separate from signal engine)
 Fires when: `current_phase == 'MID'` AND `(rsi <= 15 AND bb <= 0.10)` (UP) or `(rsi >= 85 AND bb >= 0.90)` (DOWN) AND `token_price < 0.70`.
 
-**Current guards: only `SIGNAL_ENABLED`, `session.positions`, `loss_cooldown`, `trade_cooldown`, `balance`.** The entry price guards from the signal path are NOT applied — see critical issue above.
+**Current guards (v1.3.3):** `SIGNAL_ENABLED`, `MAX_SESSION_LOSS`, `session.positions`, `loss_cooldown`, `trade_cooldown`, `balance`, `entry < $0.25` floor, `entry > MAX_ENTRY_PRICE` ceiling, `SL_DEFAULT / entry > MIN_ENTRY_SL_RATIO` ratio floor. Entry price guards are now **identical** to the signal path.
 
 TP = `entry + TP_BASE_SPREAD + 0.05`, SL = `entry - SL_DEFAULT`.
 
@@ -250,14 +258,15 @@ Signal path is net negative. MR path is much better but two large-stake losses (
 
 ## Known Remaining Issues (Priority Order)
 
-### 🔴 Priority 1 — MR Path Missing Entry Guards (NOT YET IMPLEMENTED)
-**This is the #1 fix.** See the critical section above. The MR path needs the same `entry_price < 0.25`, `entry_price > MAX_ENTRY_PRICE`, and `SL_DEFAULT / entry > MIN_ENTRY_SL_RATIO` checks that the signal path has. Two of the four largest losses in history ($3.97 and $3.50) were MR trades at $0.10–$0.15 entry with full $5 stake. Fix location: `radar_poly.py`, MR execution block, just before `handle_buy()`.
+### ✅ Priority 1 — MR Path Entry Guards — DONE (v1.3.3)
+Fixed in this session. Three guards added to MR `elif` chain before `handle_buy()`: min floor `$0.25`, max ceiling `MAX_ENTRY_PRICE ($0.85)`, SL/entry ratio `MIN_ENTRY_SL_RATIO (0.40)`. All five historical worst-case MR trades are now blocked. See fixed section above.
 
 ### 🔴 Priority 2 — Restart Bot to Activate All v1.3.x Fixes
-Three fixes are committed but not yet running:
+Four fixes are committed but not yet running (bot has not been restarted since before v1.3.0):
 - `MAX_CANDLES=60` → MACD finally live (v1.3.0)
 - RANGE block, counter-trend block, SL ratio floor (v1.3.1)
 - `MAX_ENTRY_PRICE=0.85` ceiling (v1.3.2)
+- MR entry guards (v1.3.3) ← new
 
 ### 🟡 Priority 3 — MACD Thresholds Need Calibration
 Now that MACD will be live for the first time (`W_MACD=0.10`, MACD 12/26/9 on 1-min BTC candles), the scoring thresholds in `signal_engine.py` were designed for normalised values but receive raw BTC dollar units. The MACD histogram for BTC can be ±$50. The thresholds `abs(macd_hist_delta) > 0.5` (strong) and `> 0.1` (moderate) are far too small — they will always fire at maximum score. Consider normalising: `macd_hist / atr` or `macd_hist / btc_price * 1000`. Check the first live session's signal logs to confirm MACD is non-zero and assess whether it's contributing sensibly.
@@ -291,25 +300,11 @@ Logs are written to `logs/` automatically. Check `logs/sessions.csv` for session
 
 ## What the Next Agent Should Do
 
-### Step 1 — Fix MR entry guards (Priority 1)
-In `radar_poly.py`, find the MR execution block. Search for `# All guards pass — fire immediately` inside the MR section (around line 690). Add these three checks before `handle_buy()` is called:
-
-```python
-if mr_token_price < 0.25:
-    print(f"   {Y}  MR skipped — entry ${mr_token_price:.2f} below min $0.25{X}")
-elif MAX_ENTRY_PRICE > 0 and mr_token_price > MAX_ENTRY_PRICE:
-    print(f"   {Y}  MR skipped — entry ${mr_token_price:.2f} above max ${MAX_ENTRY_PRICE:.2f}{X}")
-elif MIN_ENTRY_SL_RATIO > 0 and (SL_DEFAULT / mr_token_price) > MIN_ENTRY_SL_RATIO:
-    _ratio = SL_DEFAULT / mr_token_price
-    print(f"   {Y}  MR skipped — SL/entry ratio {_ratio:.0%} > {MIN_ENTRY_SL_RATIO:.0%}{X}")
-else:
-    # existing handle_buy() call
-```
-
-Also apply `MAX_SESSION_LOSS` check to MR path (already partially done, verify it's there).
+### Step 1 — ✅ MR entry guards — DONE (v1.3.3)
+Already implemented. Three guards (`$0.25` floor, `MAX_ENTRY_PRICE` ceiling, `SL/entry` ratio) added to the MR `elif` chain in `radar_poly.py` ~L713–L721. No further action needed here.
 
 ### Step 2 — Restart the bot
-After fixing MR guards: commit, push, then restart the bot. This activates `MAX_CANDLES=60` (MACD), all v1.3.1 regime guards, and v1.3.2 entry ceiling simultaneously for the first time.
+Commit v1.3.3, push, then restart the bot. This activates `MAX_CANDLES=60` (MACD), all v1.3.1 regime guards, v1.3.2 entry ceiling, and v1.3.3 MR guards simultaneously for the first time.
 
 ### Step 3 — Run a session and check MACD
 After restart, check the first few signal rows in `logs/signals_YYYY-MM-DD.csv`:
