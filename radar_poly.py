@@ -757,34 +757,37 @@ def main():
                 while not hunter.result_queue.empty():
                     try:
                         arb = hunter.result_queue.get_nowait()
-                        if arb.status == "FILLED":
-                            session.dn_shares_up += arb.shares_up
-                            session.dn_shares_down += arb.shares_dn
+                        if arb.status in ("FILLED", "PARTIAL"):
+                            if arb.status == "FILLED":
+                                session.dn_shares_up += arb.shares_up
+                                session.dn_shares_down += arb.shares_dn
 
-                            # Log to session stats
-                            session.session_pnl += arb.net_profit
-                            session.trade_count += 1
-                            session.trade_history.append(arb.net_profit)
+                            # Both FILLED and PARTIAL generate real P&L (PARTIAL has unwind P&L baked in)
+                            if arb.status == "FILLED" or arb.net_profit != 0.0:
+                                session.session_pnl += arb.net_profit
+                                session.trade_count += 1
+                                session.trade_history.append(arb.net_profit)
+                                
+                                # Log a mock "CLOSE" row to the CSV so external tools see the resolved profit
+                                radar_logger.log_trade(
+                                    "CLOSE", "delta_neutral",
+                                    max(arb.shares_up, 1.0), 1.0, max(arb.shares_up, 1.0) * 1.0, 
+                                    "delta_neutral_arb" if arb.status == "FILLED" else "delta_neutral_partial",
+                                    arb.net_profit, session.session_pnl
+                                )
 
-                            # Log a mock "CLOSE" row to the CSV so external tools see the resolved profit
-                            radar_logger.log_trade(
-                                "CLOSE", "delta_neutral",
-                                arb.shares_up, 1.0, arb.shares_up * 1.0, "delta_neutral_arb",
-                                arb.net_profit, session.session_pnl
-                            )
-
-                            _arb_pnl_color = G if arb.net_profit >= 0 else R
-                            print(
-                                f"   {M}{B}[DN ARB FILLED]{X} "
-                                f"UP {arb.shares_up:.0f}sh@${arb.fill_price_up:.4f} + "
-                                f"DN {arb.shares_dn:.0f}sh@${arb.fill_price_dn:.4f} │ "
-                                f"combined=${arb.combined:.4f} spread={arb.spread*100:.2f}% │ "
-                                f"{_arb_pnl_color}est.net ${arb.net_profit:+.4f}{X}"
-                            )
-                        elif arb.status == "PARTIAL":
-                            print(
-                                f"   {Y}{B}[DN PARTIAL]{X} {arb.note}"
-                            )
+                            if arb.status == "FILLED":
+                                _arb_pnl_color = G if arb.net_profit >= 0 else R
+                                print(
+                                    f"   {M}{B}[DN ARB FILLED]{X} "
+                                    f"UP {arb.shares_up:.0f}sh@${arb.fill_price_up:.4f} + "
+                                    f"DN {arb.shares_dn:.0f}sh@${arb.fill_price_dn:.4f} │ "
+                                    f"combined=${arb.combined:.4f} spread={arb.spread*100:.2f}% │ "
+                                    f"{_arb_pnl_color}est.net ${arb.net_profit:+.4f}{X}"
+                                )
+                            else:
+                                print(f"   {Y}{B}[DN PARTIAL]{X} {arb.note}")
+                                
                         elif arb.status == "FAILED":
                             print(
                                 f"   {R}[DN FAILED]{X} {arb.note}"
@@ -1231,6 +1234,28 @@ def main():
 
         # Stop Delta-Neutral Hunter
         hunter.stop()
+        
+        # Drain any final arbs that completed during shutdown
+        while not hunter.result_queue.empty():
+            try:
+                arb = hunter.result_queue.get_nowait()
+                if arb.status in ("FILLED", "PARTIAL"):
+                    if arb.status == "FILLED":
+                        session.dn_shares_up += arb.shares_up
+                        session.dn_shares_down += arb.shares_dn
+                    if arb.status == "FILLED" or arb.net_profit != 0.0:
+                        session.session_pnl += arb.net_profit
+                        session.trade_count += 1
+                        session.trade_history.append(arb.net_profit)
+                        radar_logger.log_trade(
+                            "CLOSE", "delta_neutral",
+                            max(arb.shares_up, 1.0), 1.0, max(arb.shares_up, 1.0) * 1.0, 
+                            "delta_neutral_arb" if arb.status == "FILLED" else "delta_neutral_partial",
+                            arb.net_profit, session.session_pnl
+                        )
+            except Exception:
+                pass
+
         # Stop WebSocket
         binance_ws.stop()
         # Shutdown thread pool (wait=True to prevent resource leaks)

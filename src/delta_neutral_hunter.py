@@ -431,8 +431,9 @@ class DeltaNeutralHunter:
         deadline = time.time() + DN_ORDER_TIMEOUT
         last_order = None
         while time.time() < deadline:
-            if self._stop_event.is_set():
-                return "CANCELLED", last_order
+            # We explicitly DO NOT abort on self._stop_event.is_set() here!
+            # If an order is already submitted, we must monitor it to completion
+            # so we can properly unwind excess shares and log the result even during shutdown.
             try:
                 order = self._client.get_order(order_id)
                 if isinstance(order, dict):
