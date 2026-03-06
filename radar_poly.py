@@ -484,29 +484,50 @@ def main():
             tty.setcbreak(fd)
 
     try:
-        # Clear screen and configure scroll region
-        sys.stdout.write("\033[2J")       # clear screen
-        sys.stdout.write("\033[H")        # cursor home
-        # Scroll region: from HEADER_LINES+1 to end of terminal
-        term_h = shutil.get_terminal_size().lines
-        sys.stdout.write(f"\033[{HEADER_LINES + 1};{term_h}r")
-        # Position cursor at start of scroll region
-        sys.stdout.write(f"\033[{HEADER_LINES + 1};1H")
-        sys.stdout.flush()
+        HEADLESS_MODE = os.getenv('HEADLESS_MODE', '0') in ('1', 'true', 'yes')
+        original_stdout = sys.stdout
+
+        if not HEADLESS_MODE:
+            # Clear screen and configure scroll region
+            sys.stdout.write("\033[2J")       # clear screen
+            sys.stdout.write("\033[H")        # cursor home
+            # Scroll region: from HEADER_LINES+1 to end of terminal
+            term_h = shutil.get_terminal_size().lines
+            sys.stdout.write(f"\033[{HEADER_LINES + 1};{term_h}r")
+            # Position cursor at start of scroll region
+            sys.stdout.write(f"\033[{HEADER_LINES + 1};1H")
+            sys.stdout.flush()
 
         session.last_market_check = time.time()
         session.base_time = time_remaining
         session.base_time_set_at = time.time()  # Fix #3: anchor for drift-free countdown
 
-        # Draw initial panel
-        now_str = datetime.now().strftime("%H:%M:%S")
-        draw_panel(now_str, session.balance, 0, '─', 0, {'rsi': 50, 'score': 0},
-                   session.market_slug, time_remaining, 0, 0, session.positions, None, trade_amount,
-                   session_pnl=session.session_pnl, trade_count=session.trade_count,
-                   price_to_beat=session.price_to_beat, trade_history=session.trade_history,
-                   last_action=session.last_action, asset_name=config.display_name)
+        if HEADLESS_MODE:
+            print(f"   {M}◆ Headless mode active — UI and standard output bypassed.{X}")
+            print(f"   {D}Logging trades and signals to CSV in background...{X}")
 
-        print(f"   {D}Collecting initial data...{X}")
+            # Disable ui_panel methods completely
+            global draw_panel, format_scrolling_line
+            draw_panel = lambda *args, **kwargs: None
+            format_scrolling_line = lambda *args, **kwargs: ""
+
+            # Reassign module-level print and sys.stdout to prevent IO blocking
+            class DummyStdout:
+                def write(self, s): pass
+                def flush(self): pass
+                def reconfigure(self, **kwargs): pass
+            sys.stdout = DummyStdout()
+            globals()['print'] = lambda *args, **kwargs: None
+        else:
+            # Draw initial panel
+            now_str = datetime.now().strftime("%H:%M:%S")
+            draw_panel(now_str, session.balance, 0, '─', 0, {'rsi': 50, 'score': 0},
+                       session.market_slug, time_remaining, 0, 0, session.positions, None, trade_amount,
+                       session_pnl=session.session_pnl, trade_count=session.trade_count,
+                       price_to_beat=session.price_to_beat, trade_history=session.trade_history,
+                       last_action=session.last_action, asset_name=config.display_name)
+
+            print(f"   {D}Collecting initial data...{X}")
 
         while True:
             try:
@@ -1157,6 +1178,11 @@ def main():
                     raise KeyboardInterrupt
 
             except KeyboardInterrupt:
+                if HEADLESS_MODE:
+                    import builtins
+                    sys.stdout = original_stdout
+                    globals()['print'] = builtins.print
+
                 # Reset scroll region, clear screen
                 sys.stdout.write("\033[r")
                 sys.stdout.write("\033[2J\033[H")
@@ -1187,12 +1213,22 @@ def main():
                 print(f"{Y}Radar terminated{X}")
                 break
             except Exception as e:
+                if HEADLESS_MODE:
+                    import builtins
+                    sys.stdout = original_stdout
+                    globals()['print'] = builtins.print
+
                 print(f"   {R}Error: {e}{X}")
                 key = sleep_with_key(2)
                 if key == 'q':
                     raise KeyboardInterrupt
 
     finally:
+        if HEADLESS_MODE:
+            import builtins
+            sys.stdout = original_stdout
+            globals()['print'] = builtins.print
+
         # Stop Delta-Neutral Hunter
         hunter.stop()
         # Stop WebSocket
