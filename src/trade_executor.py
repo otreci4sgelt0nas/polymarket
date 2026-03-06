@@ -125,7 +125,7 @@ def close_all_positions(positions, token_up, token_down, trade_logger, reason,
         pnl_list: list of (direction, shares, entry_price, exit_price, pnl) per position
     """
     # Submit on-chain sell orders first (best-effort) before clearing local state
-    if client is not None and executor is not None and positions:
+    if reason != 'market_expired' and client is not None and executor is not None and positions:
         try:
             close_msg = execute_close_market(client, token_up, token_down, get_price, executor)
             logger.debug("close_all_positions on-chain result: %s", close_msg)
@@ -135,6 +135,34 @@ def close_all_positions(positions, token_up, token_down, trade_logger, reason,
     total_pnl = 0.0
     count = 0
     pnl_list = []
+
+    # If it's market expired, try to pair up delta-neutral positions first
+    if reason == 'market_expired':
+        up_shares = sum(p['shares'] for p in positions if p['direction'] == 'up')
+        down_shares = sum(p['shares'] for p in positions if p['direction'] == 'down')
+        matched_pairs = min(up_shares, down_shares)
+        
+        for p in positions:
+            if p.get('shares', 0) < 0.01:
+                continue
+                
+            # Treat as Pending Settlement - we assume matched pairs net to $1.00 payout per pair
+            # This is an approximation for logging so the UI doesn't show a 100% loss.
+            # We don't realize fake losses for pending settlement.
+            exit_price = p['price'] # default to breakeven if we don't know the result
+            if matched_pairs > 0.01:
+                # Part of a DN pair that guarantees $1 payout minus cost
+                pass # Already accounted for or we can just log it at cost
+
+            pnl = 0.0 # Pending settlement, so no realized P&L here
+            
+            pnl_list.append((p['direction'], p['shares'], p['price'], exit_price, pnl))
+            trade_logger.log_trade("PENDING_SETTLEMENT", p['direction'], p['shares'], exit_price,
+                                   p['shares'] * exit_price, reason, pnl, session_pnl)
+            count += 1
+            
+        positions.clear()
+        return total_pnl, count, session_pnl, pnl_list
 
     for p in positions:
         # Skip ghost positions — floating-point dust left after a TP/SL close can

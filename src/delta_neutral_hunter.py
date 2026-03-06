@@ -67,7 +67,7 @@ _dn_stake_env = os.getenv("DN_STAKE", "")
 DN_STAKE         = float(_dn_stake_env) if _dn_stake_env else float(os.getenv("TRADE_AMOUNT", "4"))
 DN_MAX_DAILY     = int(os.getenv("DN_MAX_DAILY", "5"))
 DN_SCAN_INTERVAL = float(os.getenv("DN_SCAN_INTERVAL", "1.0"))
-DN_ORDER_TIMEOUT = int(os.getenv("DN_ORDER_TIMEOUT", "20"))
+DN_ORDER_TIMEOUT = int(os.getenv("DN_ORDER_TIMEOUT", "30"))
 DN_MIN_SHARES    = int(os.getenv("DN_MIN_SHARES", "5"))
 DN_FEE_ESTIMATE  = float(os.getenv("DN_FEE_ESTIMATE", "0.01"))
 
@@ -429,23 +429,23 @@ class DeltaNeutralHunter:
         status_str: 'FILLED' | 'CANCELLED' | 'TIMEOUT' | 'ERROR'
         """
         deadline = time.time() + DN_ORDER_TIMEOUT
+        last_order = None
         while time.time() < deadline:
             if self._stop_event.is_set():
-                return "CANCELLED", None
+                return "CANCELLED", last_order
             try:
                 order = self._client.get_order(order_id)
-                if not isinstance(order, dict):
-                    time.sleep(1)
-                    continue
-                status = order.get("status", "UNKNOWN")
-                if status in ("MATCHED", "FILLED"):
-                    return "FILLED", order
-                if status in ("CANCELED", "CANCELLED"):
-                    return "CANCELLED", order
+                if isinstance(order, dict):
+                    last_order = order
+                    status = order.get("status", "UNKNOWN")
+                    if status in ("MATCHED", "FILLED"):
+                        return "FILLED", order
+                    if status in ("CANCELED", "CANCELLED"):
+                        return "CANCELLED", order
             except Exception as e:
                 logger.debug("[DN Hunter] poll_order %s: %s", order_id[:8], e)
             time.sleep(1)
-        return "TIMEOUT", None
+        return "TIMEOUT", last_order
 
     def _cancel_order(self, order_id: str) -> None:
         """Best-effort cancel — never raises."""
@@ -494,6 +494,12 @@ class DeltaNeutralHunter:
         combined_price = price_up + price_dn
 
         target_shares = round(target_total_spend / combined_price, 2)
+
+        # Capital Safeguard: Scale down if balance is insufficient
+        # Leave a small $0.05 buffer to prevent rounding rejections
+        max_spend_allowed = max(0.0, current_balance - 0.05)
+        if (target_shares * combined_price) > max_spend_allowed:
+            target_shares = round(max_spend_allowed / combined_price, 2)
 
         shares_up = target_shares
         shares_dn = target_shares
@@ -594,15 +600,24 @@ class DeltaNeutralHunter:
 
         fill_price_up = 0.0
         fill_price_dn = 0.0
+        filled_shares_up = shares_up if filled_up else 0.0
+        filled_shares_dn = shares_dn if filled_dn else 0.0
+
         if details_up and isinstance(details_up, dict):
             fill_price_up = float(details_up.get("price", price_up))
-            # Some responses carry avg_price on partial fills
             if "avg_price" in details_up:
                 fill_price_up = float(details_up["avg_price"]) or fill_price_up
+            sm = details_up.get("size_matched") or details_up.get("sizeMatched")
+            if sm is not None:
+                filled_shares_up = float(sm)
+
         if details_dn and isinstance(details_dn, dict):
             fill_price_dn = float(details_dn.get("price", price_dn))
             if "avg_price" in details_dn:
                 fill_price_dn = float(details_dn["avg_price"]) or fill_price_dn
+            sm = details_dn.get("size_matched") or details_dn.get("sizeMatched")
+            if sm is not None:
+                filled_shares_dn = float(sm)
 
         # Fall back to submitted price if response is zero
         if fill_price_up <= 0:
@@ -611,7 +626,7 @@ class DeltaNeutralHunter:
             fill_price_dn = price_dn
 
         # ── Assess outcome ────────────────────────────────────────────────
-        if filled_up and filled_dn:
+        if filled_shares_up >= shares_up and filled_shares_dn >= shares_dn:
             actual_combined = fill_price_up + fill_price_dn
             # Gross profit: $1 payout - combined cost, per share (up side determines pairs)
             gross_per_pair = 1.0 - actual_combined
@@ -636,40 +651,76 @@ class DeltaNeutralHunter:
             )
 
         # ── One or both legs failed — attempt mitigation ──────────────────
-        if filled_up and not filled_dn:
+        if filled_shares_up > 0 and filled_shares_dn == 0:
             # DN failed: cancel UP if still open, then try a market sell on UP
             # to unwind. We use a low limit price to guarantee a fill.
+            self._cancel_order(order_id_up)
             self._cancel_order(order_id_dn)
             self._print(
                 f"   {Y}{B}[DN Hunter]{X} {Y}DN leg did not fill ({status_dn}). "
-                f"Attempting UP leg unwind...{X}"
+                f"Attempting UP leg unwind of {filled_shares_up:.2f}sh...{X}"
             )
-            self._unwind_leg(token_up, shares_up)
+            unwind_pnl = self._unwind_leg(token_up, filled_shares_up, fill_price_up)
             return ArbResult(
                 timestamp=now_str, ask_up=ask_up, ask_dn=ask_dn,
                 combined=combined, spread=spread,
-                shares_up=shares_up, shares_dn=0,
+                shares_up=filled_shares_up, shares_dn=0,
                 fill_price_up=fill_price_up, fill_price_dn=0.0,
                 status="PARTIAL",
-                net_profit=0.0,
-                note=f"UP filled, DN {status_dn}. UP unwind attempted.",
+                net_profit=unwind_pnl,
+                note=f"UP filled {filled_shares_up:.2f}sh, DN {status_dn}. UP unwind attempted. Unwind P&L: ${unwind_pnl:.2f}",
             )
 
-        if filled_dn and not filled_up:
+        if filled_shares_dn > 0 and filled_shares_up == 0:
             self._cancel_order(order_id_up)
+            self._cancel_order(order_id_dn)
             self._print(
                 f"   {Y}{B}[DN Hunter]{X} {Y}UP leg did not fill ({status_up}). "
-                f"Attempting DN leg unwind...{X}"
+                f"Attempting DN leg unwind of {filled_shares_dn:.2f}sh...{X}"
             )
-            self._unwind_leg(token_dn, shares_dn)
+            unwind_pnl = self._unwind_leg(token_dn, filled_shares_dn, fill_price_dn)
             return ArbResult(
                 timestamp=now_str, ask_up=ask_up, ask_dn=ask_dn,
                 combined=combined, spread=spread,
-                shares_up=0, shares_dn=shares_dn,
+                shares_up=0, shares_dn=filled_shares_dn,
                 fill_price_up=0.0, fill_price_dn=fill_price_dn,
                 status="PARTIAL",
-                net_profit=0.0,
-                note=f"DN filled, UP {status_up}. DN unwind attempted.",
+                net_profit=unwind_pnl,
+                note=f"DN filled {filled_shares_dn:.2f}sh, UP {status_up}. DN unwind attempted. Unwind P&L: ${unwind_pnl:.2f}",
+            )
+
+        if filled_shares_up > 0 and filled_shares_dn > 0 and (filled_shares_up < shares_up or filled_shares_dn < shares_dn):
+            # Both filled partially but unevenly. We keep the matched pairs and unwind the rest.
+            self._cancel_order(order_id_up)
+            self._cancel_order(order_id_dn)
+            matched_pairs = min(filled_shares_up, filled_shares_dn)
+            unwind_up = filled_shares_up - matched_pairs
+            unwind_dn = filled_shares_dn - matched_pairs
+            unwind_pnl_up = 0.0
+            unwind_pnl_dn = 0.0
+
+            if unwind_up > 0:
+                self._print(f"   {Y}{B}[DN Hunter]{X} {Y}Imbalanced fill. Unwinding {unwind_up:.2f} excess UP sh...{X}")
+                unwind_pnl_up = self._unwind_leg(token_up, unwind_up, fill_price_up)
+            if unwind_dn > 0:
+                self._print(f"   {Y}{B}[DN Hunter]{X} {Y}Imbalanced fill. Unwinding {unwind_dn:.2f} excess DN sh...{X}")
+                unwind_pnl_dn = self._unwind_leg(token_dn, unwind_dn, fill_price_dn)
+
+            actual_combined = fill_price_up + fill_price_dn
+            gross_per_pair = 1.0 - actual_combined
+            fee_up = fill_price_up * matched_pairs * DN_FEE_ESTIMATE
+            fee_dn = fill_price_dn * matched_pairs * DN_FEE_ESTIMATE
+            pair_profit = (gross_per_pair * matched_pairs) - fee_up - fee_dn
+            total_net = pair_profit + unwind_pnl_up + unwind_pnl_dn
+
+            return ArbResult(
+                timestamp=now_str, ask_up=ask_up, ask_dn=ask_dn,
+                combined=actual_combined, spread=1.0 - actual_combined,
+                shares_up=matched_pairs, shares_dn=matched_pairs,
+                fill_price_up=fill_price_up, fill_price_dn=fill_price_dn,
+                status="FILLED" if matched_pairs > 0 else "PARTIAL",
+                net_profit=total_net,
+                note=f"Imbalanced fill (UP: {filled_shares_up:.2f}, DN: {filled_shares_dn:.2f}). Kept {matched_pairs:.2f} pairs, unwound excess. Net: ${total_net:.4f}",
             )
 
         # Both failed / timed out / cancelled
@@ -685,12 +736,16 @@ class DeltaNeutralHunter:
             note=f"Both legs failed: UP={status_up} DN={status_dn}.",
         )
 
-    def _unwind_leg(self, token_id: str, shares: float) -> None:
+    def _unwind_leg(self, token_id: str, shares: float, entry_price: float) -> float:
         """
         Best-effort market sell of a single filled leg to neutralise a partial arb.
         Uses a very aggressive low limit price to maximise fill probability.
         Logs the attempt but never raises — caller continues regardless.
+        Returns the net profit (or loss) of the unwind.
         """
+        if shares <= 0:
+            return 0.0
+
         UNWIND_PRICE = 0.01   # floor — guarantees fill at any bid above dust
         try:
             tick_size = self._client.get_tick_size(token_id)
@@ -704,12 +759,18 @@ class DeltaNeutralHunter:
             if isinstance(resp, dict):
                 order_id = resp.get("orderID") or resp.get("id")
             if order_id:
-                # Poll briefly — unwind doesn't need to be perfect, just attempted
-                status, _ = self._poll_order_fill(order_id)
+                # Poll briefly
+                status, details = self._poll_order_fill(order_id)
                 if status == "FILLED":
+                    exit_price = UNWIND_PRICE
+                    if details and isinstance(details, dict) and "avg_price" in details:
+                        exit_price = float(details["avg_price"]) or exit_price
+                    pnl = (exit_price - entry_price) * shares
                     self._print(
-                        f"   {G}[DN Hunter] Unwind filled for {shares:.2f}sh @ ≤${UNWIND_PRICE:.2f}{X}"
+                        f"   {G}[DN Hunter] Unwind filled for {shares:.2f}sh @ ${exit_price:.4f} "
+                        f"(P&L: ${pnl:.4f}){X}"
                     )
+                    return pnl
                 else:
                     self._print(
                         f"   {Y}[DN Hunter] Unwind {status} for {shares:.2f}sh — "
@@ -724,6 +785,10 @@ class DeltaNeutralHunter:
             self._print(
                 f"   {R}[DN Hunter] Unwind exception: {e} — check open orders manually.{X}"
             )
+
+        # If we reach here, we failed to confirm a fill. Assume worst-case fill at 0.01 for P&L tracking
+        # to ensure safety.
+        return (UNWIND_PRICE - entry_price) * shares
 
 
 # ── Module-level helper for UI panel ──────────────────────────────────────────

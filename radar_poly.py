@@ -748,7 +748,7 @@ def main():
                             # Log a mock "CLOSE" row to the CSV so external tools see the resolved profit
                             radar_logger.log_trade(
                                 "CLOSE", "delta_neutral",
-                                1.0, 1.0, 1.0, "delta_neutral_arb",
+                                arb.shares_up, 1.0, arb.shares_up * 1.0, "delta_neutral_arb",
                                 arb.net_profit, session.session_pnl
                             )
 
