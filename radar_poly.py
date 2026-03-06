@@ -81,6 +81,7 @@ from delta_neutral_hunter import DeltaNeutralHunter, hunter_status_str, DN_ENABL
 from binance_api import reset_vwap_anchor
 from input_handler import sleep_with_key
 from session_stats import print_session_summary
+from auto_claim import AutoClaimer
 
 # Configuration
 PRICE_ALERT = float(os.getenv('PRICE_ALERT', '0.80'))
@@ -471,6 +472,12 @@ def main():
     else:
         print(f"   {D}◆ Delta-Neutral Hunter disabled (DN_ENABLED=0){X}")
 
+    # -- Auto Claimer --
+    auto_claimer = AutoClaimer(radar_logger, session, get_price)
+    auto_claimer._print_lock = _print_lock
+    auto_claimer.start()
+    print(f"   {M}◆ Auto-Claimer started{X} — pending settlements will be resolved automatically")
+
     print(f"   {G}Ready! Starting in 2s...{X}")
     time.sleep(2)
 
@@ -557,9 +564,15 @@ def main():
                                     session.session_pnl, session.trade_history, get_price,
                                     client=client, executor=_executor)
                                 session.trade_count += cnt
+
+                                pending_pos = []
                                 for d, sh, ep, xp, pnl in pnl_list:
                                     pnl_color = G if pnl >= 0 else R
                                     print(f"   {Y}  expired {d.upper()} {sh:.0f}sh @ ${ep:.2f} → ${xp:.2f} {pnl_color}P&L: {'+' if pnl >= 0 else ''}${pnl:.2f}{X}")
+                                    pending_pos.append({'direction': d, 'shares': sh, 'price': ep})
+
+                                if pending_pos and 'auto_claimer' in locals():
+                                    auto_claimer.add_pending_positions(session.market_slug, pending_pos)
                             session.history.clear()
                             reset_vwap_anchor()  # Fix #8: reset session VWAP on new market window
                             session.dn_shares_up = 0.0
@@ -767,11 +780,11 @@ def main():
                                 session.session_pnl += arb.net_profit
                                 session.trade_count += 1
                                 session.trade_history.append(arb.net_profit)
-                                
+
                                 # Log a mock "CLOSE" row to the CSV so external tools see the resolved profit
                                 radar_logger.log_trade(
                                     "CLOSE", "delta_neutral",
-                                    max(arb.shares_up, 1.0), 1.0, max(arb.shares_up, 1.0) * 1.0, 
+                                    max(arb.shares_up, 1.0), 1.0, max(arb.shares_up, 1.0) * 1.0,
                                     "delta_neutral_arb" if arb.status == "FILLED" else "delta_neutral_partial",
                                     arb.net_profit, session.session_pnl
                                 )
@@ -787,7 +800,7 @@ def main():
                                 )
                             else:
                                 print(f"   {Y}{B}[DN PARTIAL]{X} {arb.note}")
-                                
+
                         elif arb.status == "FAILED":
                             print(
                                 f"   {R}[DN FAILED]{X} {arb.note}"
@@ -1234,7 +1247,11 @@ def main():
 
         # Stop Delta-Neutral Hunter
         hunter.stop()
-        
+
+        # Stop Auto Claimer
+        if 'auto_claimer' in locals():
+            auto_claimer.stop()
+
         # Drain any final arbs that completed during shutdown
         while not hunter.result_queue.empty():
             try:
@@ -1249,7 +1266,7 @@ def main():
                         session.trade_history.append(arb.net_profit)
                         radar_logger.log_trade(
                             "CLOSE", "delta_neutral",
-                            max(arb.shares_up, 1.0), 1.0, max(arb.shares_up, 1.0) * 1.0, 
+                            max(arb.shares_up, 1.0), 1.0, max(arb.shares_up, 1.0) * 1.0,
                             "delta_neutral_arb" if arb.status == "FILLED" else "delta_neutral_partial",
                             arb.net_profit, session.session_pnl
                         )
