@@ -44,6 +44,7 @@ import os
 import queue
 import threading
 import time
+import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
 from datetime import datetime
 
@@ -63,6 +64,7 @@ logger = logging.getLogger(__name__)
 
 DN_ENABLED       = os.getenv("DN_ENABLED", "1").lower() in ("1", "true", "yes")
 DN_THRESHOLD     = float(os.getenv("DN_THRESHOLD", "0.985"))
+DN_MAX_COMBINED_PRICE = float(os.getenv("DN_MAX_COMBINED_PRICE", "0.985"))
 _dn_stake_env = os.getenv("DN_STAKE", "")
 DN_STAKE         = float(_dn_stake_env) if _dn_stake_env else float(os.getenv("TRADE_AMOUNT", "4"))
 DN_MAX_DAILY     = int(os.getenv("DN_MAX_DAILY", "5"))
@@ -273,19 +275,19 @@ class DeltaNeutralHunter:
                 time.sleep(DN_SCAN_INTERVAL)
                 continue
 
-            # ── Fetch both asks concurrently ──────────────────────────────
+            # ── Fetch both order books concurrently ───────────────────────
             try:
-                fut_up = self._executor.submit(self._get_price, token_up, "BUY")
-                fut_dn = self._executor.submit(self._get_price, token_dn, "BUY")
-                ask_up = fut_up.result(timeout=5)
-                ask_dn = fut_dn.result(timeout=5)
+                fut_up = self._executor.submit(self._fetch_order_book, token_up)
+                fut_dn = self._executor.submit(self._fetch_order_book, token_dn)
+                asks_up = fut_up.result(timeout=5)
+                asks_dn = fut_dn.result(timeout=5)
                 consecutive_errors = 0
             except (FuturesTimeout, Exception) as e:
                 consecutive_errors += 1
-                logger.debug("[DN Hunter] price fetch error (streak=%d): %s", consecutive_errors, e)
+                logger.debug("[DN Hunter] order book fetch error (streak=%d): %s", consecutive_errors, e)
                 if consecutive_errors >= 5:
                     self._print(
-                        f"   {M}{B}[DN Hunter]{X} {Y}⚠ {consecutive_errors} consecutive price errors — "
+                        f"   {M}{B}[DN Hunter]{X} {Y}⚠ {consecutive_errors} consecutive book errors — "
                         f"sleeping 10s{X}"
                     )
                     time.sleep(10)
@@ -293,37 +295,42 @@ class DeltaNeutralHunter:
                     time.sleep(DN_SCAN_INTERVAL)
                 continue
 
-            if ask_up <= 0 or ask_dn <= 0:
+            if not asks_up or not asks_dn:
                 time.sleep(DN_SCAN_INTERVAL)
                 continue
 
-            combined = ask_up + ask_dn
+            best_ask_up = float(asks_up[0]["price"])
+            best_ask_dn = float(asks_dn[0]["price"])
+            combined = best_ask_up + best_ask_dn
             self.last_combined = combined
             self.status = "scanning"
 
-            # ── Opportunity? ──────────────────────────────────────────────
+            # ── Opportunity? Quick top-of-book check ──────────────────────
             if combined >= DN_THRESHOLD:
                 time.sleep(DN_SCAN_INTERVAL)
                 continue
 
             # Double-check: re-fetch immediately to filter stale quotes
             try:
-                fut_up2 = self._executor.submit(self._get_price, token_up, "BUY")
-                fut_dn2 = self._executor.submit(self._get_price, token_dn, "BUY")
-                ask_up2 = fut_up2.result(timeout=5)
-                ask_dn2 = fut_dn2.result(timeout=5)
+                fut_up2 = self._executor.submit(self._fetch_order_book, token_up)
+                fut_dn2 = self._executor.submit(self._fetch_order_book, token_dn)
+                asks_up2 = fut_up2.result(timeout=5)
+                asks_dn2 = fut_dn2.result(timeout=5)
             except Exception as e:
                 logger.debug("[DN Hunter] confirmation fetch failed: %s", e)
                 time.sleep(DN_SCAN_INTERVAL)
                 continue
 
-            combined2 = ask_up2 + ask_dn2
-            # Use the worse (higher) of the two combined quotes for conservatism
-            worst_combined = max(combined, combined2)
-            ask_up_use = max(ask_up, ask_up2)
-            ask_dn_use = max(ask_dn, ask_dn2)
+            if not asks_up2 or not asks_dn2:
+                time.sleep(DN_SCAN_INTERVAL)
+                continue
 
-            if worst_combined >= DN_THRESHOLD:
+            best_ask_up2 = float(asks_up2[0]["price"])
+            best_ask_dn2 = float(asks_dn2[0]["price"])
+            combined2 = best_ask_up2 + best_ask_dn2
+            worst_combined_top = max(combined, combined2)
+
+            if worst_combined_top >= DN_THRESHOLD:
                 logger.debug(
                     "[DN Hunter] Opportunity evaporated on re-check: %.4f → %.4f",
                     combined, combined2,
@@ -331,21 +338,11 @@ class DeltaNeutralHunter:
                 time.sleep(DN_SCAN_INTERVAL)
                 continue
 
-            spread = 1.0 - worst_combined
-            now_str = datetime.now().strftime("%H:%M:%S")
-            self._print(
-                f"\n   {M}{B}{'═' * 55}{X}\n"
-                f"   {M}{B}  DELTA-NEUTRAL ARB ◆ {now_str}{X}\n"
-                f"   {W}  UP ask: {G}${ask_up_use:.4f}{X}  DN ask: {R}${ask_dn_use:.4f}{X}  "
-                f"Combined: {C}{B}${worst_combined:.4f}{X}  "
-                f"Spread: {G}{B}+${spread:.4f} ({spread*100:.2f}%){X}\n"
-                f"   {M}{B}{'═' * 55}{X}"
-            )
+            # ── Liquidity-Aware Sizing ────────────────────────────────────
+            # Use the most recent order books
+            asks_up_use = asks_up2
+            asks_dn_use = asks_dn2
 
-            # ── Execute both legs ─────────────────────────────────────────
-            self.status = "firing"
-
-            # Fetch balance if available, otherwise assume enough (to not break old behavior)
             current_balance = float('inf')
             if self._get_balance and self._client:
                 try:
@@ -353,8 +350,62 @@ class DeltaNeutralHunter:
                 except Exception as e:
                     logger.debug("[DN Hunter] balance fetch error: %s", e)
 
-            result = self._execute_arb(token_up, token_dn, ask_up_use, ask_dn_use,
-                                       worst_combined, spread, now_str, current_balance)
+            budget_usd = min(self.stake_amount * 2.0, current_balance - 0.05)
+            if budget_usd < 0:
+                budget_usd = 0
+            # Rough target shares before VWAP limit
+            budget_shares = budget_usd / worst_combined_top if worst_combined_top > 0 else 0
+
+            safe_shares, vwap_up, vwap_dn, limit_up, limit_dn = self._calculate_safe_shares(
+                asks_up_use, asks_dn_use, budget_shares, DN_MAX_COMBINED_PRICE
+            )
+
+            combined_vwap = vwap_up + vwap_dn
+            spread = 1.0 - combined_vwap
+
+            if safe_shares < DN_MIN_SHARES:
+                now_str = datetime.now().strftime("%H:%M:%S")
+                self._print(
+                    f"
+   {M}{B}{'═' * 55}{X}
+"
+                    f"   {M}{B}  DELTA-NEUTRAL ARB ◆ {now_str}{X}
+"
+                    f"   {Y}  FAILED: Insufficient Liquidity{X}
+"
+                    f"   {W}  Can only safely buy {safe_shares:.2f}sh (min {DN_MIN_SHARES}){X}
+"
+                    f"   {W}  Top combined: ${worst_combined_top:.4f} → VWAP ceiling: ${DN_MAX_COMBINED_PRICE:.4f}{X}
+"
+                    f"   {M}{B}{'═' * 55}{X}"
+                )
+                time.sleep(DN_SCAN_INTERVAL)
+                continue
+
+            now_str = datetime.now().strftime("%H:%M:%S")
+            self._print(
+                f"
+   {M}{B}{'═' * 55}{X}
+"
+                f"   {M}{B}  DELTA-NEUTRAL ARB ◆ {now_str}{X}
+"
+                f"   {W}  Safe Shares: {C}{B}{safe_shares:.2f}sh{X}
+"
+                f"   {W}  VWAP UP: {G}${vwap_up:.4f}{X}  VWAP DN: {R}${vwap_dn:.4f}{X}
+"
+                f"   {W}  Limit UP: {G}${limit_up:.4f}{X} Limit DN: {R}${limit_dn:.4f}{X}
+"
+                f"   {W}  Combined VWAP: {C}{B}${combined_vwap:.4f}{X}  "
+                f"Spread: {G}{B}+${spread:.4f} ({spread*100:.2f}%){X}
+"
+                f"   {M}{B}{'═' * 55}{X}"
+            )
+
+            # ── Execute both legs ─────────────────────────────────────────
+            self.status = "firing"
+
+            result = self._execute_arb(token_up, token_dn, limit_up, limit_dn, safe_shares,
+                                       combined_vwap, spread, now_str)
             self.result_queue.put(result)
 
             if result.status == "FILLED":
@@ -459,79 +510,23 @@ class DeltaNeutralHunter:
         self,
         token_up: str,
         token_dn: str,
-        ask_up: float,
-        ask_dn: float,
-        combined: float,
+        limit_up: float,
+        limit_dn: float,
+        shares: float,
+        combined_vwap: float,
         spread: float,
         now_str: str,
-        current_balance: float = float('inf'),
     ) -> ArbResult:
         """
         Submit both legs simultaneously, poll for fills, cancel if either fails.
-
-        Strategy:
-          - Both orders go in as GTC limit buys at the observed ask price.
-          - We poll both orders concurrently.
-          - If BOTH fill → FILLED result.
-          - If one fills and the other fails/cancels → cancel the filled leg too
-            (market sell via a limit order well below mid, at SL_MIN_PRICE floor)
-            and return PARTIAL.
-          - If both fail → FAILED result.
-
-        Order price = ask price exactly (no additional offset — the arb spread
-        IS the profit; adding BUY_PRICE_OFFSET would reduce it further).
-        We cap at 0.99 to avoid CLOB rejection.
         """
         MAX_PRICE = 0.99
-        MIN_SHARES = max(DN_MIN_SHARES, 1)
 
-        price_up = min(round(ask_up, 4), MAX_PRICE)
-        price_dn = min(round(ask_dn, 4), MAX_PRICE)
+        price_up = limit_up
+        price_dn = limit_dn
 
-        # For a true Delta-Neutral arb on Polymarket, you MUST buy the exact same
-        # number of shares on both sides. Otherwise, you take directional risk.
-        # We target a total spend of approximately 2 * stake_amount.
-        target_total_spend = 2.0 * self.stake_amount
-        combined_price = price_up + price_dn
-
-        target_shares = round(target_total_spend / combined_price, 2)
-
-        # Capital Safeguard: Scale down if balance is insufficient
-        # Leave a small $0.05 buffer to prevent rounding rejections
-        max_spend_allowed = max(0.0, current_balance - 0.05)
-        if (target_shares * combined_price) > max_spend_allowed:
-            target_shares = round(max_spend_allowed / combined_price, 2)
-
-        shares_up = target_shares
-        shares_dn = target_shares
-
-        total_cost = (shares_up * price_up) + (shares_dn * price_dn)
-        if current_balance < total_cost:
-            return ArbResult(
-                timestamp=now_str, ask_up=ask_up, ask_dn=ask_dn,
-                combined=combined, spread=spread,
-                shares_up=shares_up, shares_dn=shares_dn,
-                fill_price_up=0.0, fill_price_dn=0.0,
-                status="FAILED", net_profit=0.0,
-                note=(
-                    f"Insufficient balance: need ${total_cost:.2f} "
-                    f"(UP=${shares_up*price_up:.2f}, DN=${shares_dn*price_dn:.2f}), "
-                    f"have ${current_balance:.2f}."
-                ),
-            )
-
-        if shares_up < MIN_SHARES or shares_dn < MIN_SHARES:
-            return ArbResult(
-                timestamp=now_str, ask_up=ask_up, ask_dn=ask_dn,
-                combined=combined, spread=spread,
-                shares_up=shares_up, shares_dn=shares_dn,
-                fill_price_up=0.0, fill_price_dn=0.0,
-                status="FAILED", net_profit=0.0,
-                note=(
-                    f"Shares below minimum: UP={shares_up:.2f} DN={shares_dn:.2f} "
-                    f"(min={MIN_SHARES}). Increase DN_STAKE / TRADE_AMOUNT."
-                ),
-            )
+        shares_up = shares
+        shares_dn = shares
 
         # ── Submit both orders concurrently ───────────────────────────────
         self._print(
@@ -845,3 +840,202 @@ def hunter_status_str(hunter: "DeltaNeutralHunter | None") -> str:
         f"{M}◆ DN scanning{X}{combined_str} "
         f"{D}{count} arbs{X}{pnl_str}"
     )
+
+    def _fetch_order_book(self, token_id: str) -> list[dict]:
+        try:
+            resp = requests.get(f"{CLOB}/book", params={"token_id": token_id}, timeout=5)
+            data = resp.json()
+            return data.get("asks", [])
+        except Exception as e:
+            logger.debug("[DN Hunter] _fetch_order_book error for %s: %s", token_id[:8], e)
+            return []
+
+    def _calculate_safe_shares(self, asks_up: list[dict], asks_dn: list[dict], budget_shares: float, max_combined_price: float) -> tuple[float, float, float, float, float]:
+        """
+        Traverses both order books to find the maximum shares we can buy
+        such that the VWAP_up + VWAP_dn <= max_combined_price.
+        Returns: (safe_shares, vwap_up, vwap_dn, limit_up, limit_dn)
+        """
+        if not asks_up or not asks_dn:
+            return 0.0, 0.0, 0.0, 0.0, 0.0
+
+        idx_up, idx_dn = 0, 0
+        shares_accumulated = 0.0
+        cost_up_accumulated = 0.0
+        cost_dn_accumulated = 0.0
+
+        limit_up = 0.0
+        limit_dn = 0.0
+
+        rem_up_size = float(asks_up[0]["size"])
+        rem_up_price = float(asks_up[0]["price"])
+
+        rem_dn_size = float(asks_dn[0]["size"])
+        rem_dn_price = float(asks_dn[0]["price"])
+
+        while True:
+            take_shares = min(rem_up_size, rem_dn_size)
+
+            new_shares = shares_accumulated + take_shares
+            new_cost_up = cost_up_accumulated + (take_shares * rem_up_price)
+            new_cost_dn = cost_dn_accumulated + (take_shares * rem_dn_price)
+
+            vwap_up = new_cost_up / new_shares
+            vwap_dn = new_cost_dn / new_shares
+            combined_vwap = vwap_up + vwap_dn
+
+            if combined_vwap > max_combined_price:
+                P_total = rem_up_price + rem_dn_price
+                C_total = cost_up_accumulated + cost_dn_accumulated
+                S = shares_accumulated
+
+                if P_total > max_combined_price:
+                    x = (max_combined_price * S - C_total) / (P_total - max_combined_price)
+                    if x > 0:
+                        take_shares = x
+                        shares_accumulated += take_shares
+                        cost_up_accumulated += take_shares * rem_up_price
+                        cost_dn_accumulated += take_shares * rem_dn_price
+                        limit_up = rem_up_price
+                        limit_dn = rem_dn_price
+                break
+
+            shares_accumulated = new_shares
+            cost_up_accumulated = new_cost_up
+            cost_dn_accumulated = new_cost_dn
+            limit_up = rem_up_price
+            limit_dn = rem_dn_price
+
+            rem_up_size -= take_shares
+            rem_dn_size -= take_shares
+
+            if rem_up_size <= 1e-6:
+                idx_up += 1
+                if idx_up >= len(asks_up): break
+                rem_up_size = float(asks_up[idx_up]["size"])
+                rem_up_price = float(asks_up[idx_up]["price"])
+
+            if rem_dn_size <= 1e-6:
+                idx_dn += 1
+                if idx_dn >= len(asks_dn): break
+                rem_dn_size = float(asks_dn[idx_dn]["size"])
+                rem_dn_price = float(asks_dn[idx_dn]["price"])
+
+            if shares_accumulated >= budget_shares:
+                break
+
+        if shares_accumulated > budget_shares:
+            # We stepped slightly over our budget, rewind exactly to budget
+            excess = shares_accumulated - budget_shares
+            shares_accumulated -= excess
+            cost_up_accumulated -= excess * limit_up
+            cost_dn_accumulated -= excess * limit_dn
+
+        # Cap limit prices at 0.99
+        limit_up = min(round(limit_up, 4), 0.99)
+        limit_dn = min(round(limit_dn, 4), 0.99)
+
+        vwap_up = cost_up_accumulated / shares_accumulated if shares_accumulated > 0 else 0
+        vwap_dn = cost_dn_accumulated / shares_accumulated if shares_accumulated > 0 else 0
+
+        return round(shares_accumulated, 2), vwap_up, vwap_dn, limit_up, limit_dn
+
+    def _fetch_order_book(self, token_id: str) -> list[dict]:
+        try:
+            resp = requests.get(f"{CLOB}/book", params={"token_id": token_id}, timeout=5)
+            data = resp.json()
+            return data.get("asks", [])
+        except Exception as e:
+            logger.debug("[DN Hunter] _fetch_order_book error for %s: %s", token_id[:8], e)
+            return []
+
+    def _calculate_safe_shares(self, asks_up: list[dict], asks_dn: list[dict], budget_shares: float, max_combined_price: float) -> tuple[float, float, float, float, float]:
+        """
+        Traverses both order books to find the maximum shares we can buy
+        such that the VWAP_up + VWAP_dn <= max_combined_price.
+        Returns: (safe_shares, vwap_up, vwap_dn, limit_up, limit_dn)
+        """
+        if not asks_up or not asks_dn:
+            return 0.0, 0.0, 0.0, 0.0, 0.0
+
+        idx_up, idx_dn = 0, 0
+        shares_accumulated = 0.0
+        cost_up_accumulated = 0.0
+        cost_dn_accumulated = 0.0
+
+        limit_up = 0.0
+        limit_dn = 0.0
+
+        rem_up_size = float(asks_up[0]["size"])
+        rem_up_price = float(asks_up[0]["price"])
+
+        rem_dn_size = float(asks_dn[0]["size"])
+        rem_dn_price = float(asks_dn[0]["price"])
+
+        while True:
+            take_shares = min(rem_up_size, rem_dn_size)
+
+            new_shares = shares_accumulated + take_shares
+            new_cost_up = cost_up_accumulated + (take_shares * rem_up_price)
+            new_cost_dn = cost_dn_accumulated + (take_shares * rem_dn_price)
+
+            vwap_up = new_cost_up / new_shares
+            vwap_dn = new_cost_dn / new_shares
+            combined_vwap = vwap_up + vwap_dn
+
+            if combined_vwap > max_combined_price:
+                P_total = rem_up_price + rem_dn_price
+                C_total = cost_up_accumulated + cost_dn_accumulated
+                S = shares_accumulated
+
+                if P_total > max_combined_price:
+                    x = (max_combined_price * S - C_total) / (P_total - max_combined_price)
+                    if x > 0:
+                        take_shares = x
+                        shares_accumulated += take_shares
+                        cost_up_accumulated += take_shares * rem_up_price
+                        cost_dn_accumulated += take_shares * rem_dn_price
+                        limit_up = rem_up_price
+                        limit_dn = rem_dn_price
+                break
+
+            shares_accumulated = new_shares
+            cost_up_accumulated = new_cost_up
+            cost_dn_accumulated = new_cost_dn
+            limit_up = rem_up_price
+            limit_dn = rem_dn_price
+
+            rem_up_size -= take_shares
+            rem_dn_size -= take_shares
+
+            if rem_up_size <= 1e-6:
+                idx_up += 1
+                if idx_up >= len(asks_up): break
+                rem_up_size = float(asks_up[idx_up]["size"])
+                rem_up_price = float(asks_up[idx_up]["price"])
+
+            if rem_dn_size <= 1e-6:
+                idx_dn += 1
+                if idx_dn >= len(asks_dn): break
+                rem_dn_size = float(asks_dn[idx_dn]["size"])
+                rem_dn_price = float(asks_dn[idx_dn]["price"])
+
+            if shares_accumulated >= budget_shares:
+                break
+
+        if shares_accumulated > budget_shares:
+            # We stepped slightly over our budget, rewind exactly to budget
+            excess = shares_accumulated - budget_shares
+            shares_accumulated -= excess
+            cost_up_accumulated -= excess * limit_up
+            cost_dn_accumulated -= excess * limit_dn
+
+        # Cap limit prices at 0.99
+        limit_up = min(round(limit_up, 4), 0.99)
+        limit_dn = min(round(limit_dn, 4), 0.99)
+
+        vwap_up = cost_up_accumulated / shares_accumulated if shares_accumulated > 0 else 0
+        vwap_dn = cost_dn_accumulated / shares_accumulated if shares_accumulated > 0 else 0
+
+        return round(shares_accumulated, 2), vwap_up, vwap_dn, limit_up, limit_dn
+
